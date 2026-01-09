@@ -133,6 +133,7 @@ def main():
     enc_feat2 = mx.fast.layer_norm(
         feat2_mlx, decoder.enc_norm_weight, decoder.enc_norm_bias, eps=1e-6
     )
+    mx.eval(enc_feat1, enc_feat2)
 
     # Project to decoder dim
     x1 = decoder.decoder_embed(enc_feat1)
@@ -144,7 +145,7 @@ def main():
 
     # Hooks: [0, 6, 9, 12]
     hooks = [0, 6, 9, 12]
-    mlx_features = [np.array(feat1_mlx[0])]  # Hook 0: encoder features
+    mlx_features = [np.array(enc_feat1[0])]  # Hook 0: encoder features AFTER enc_norm
 
     # Run decoder blocks (PyTorch uses OLD x1/x2 for BOTH blocks)
     for i, (blk1, blk2) in enumerate(zip(decoder.dec_blocks, decoder.dec_blocks2)):
@@ -176,21 +177,23 @@ def main():
     pt_dpt = pt_model.downstream_head1.dpt
     print(f"  PyTorch DPT hooks: {pt_dpt.hooks}")
 
-    # Map MLX features to PyTorch features based on hooks
-    # MLX features[i] corresponds to PT features[hooks[i]]
+    # PyTorch returns 13 features (one per layer 0-12)
+    # MLX collects only 4 features at hooks [0, 6, 9, 12]
+    # So we use hook indices to access PT features, sequential indices for MLX
     pt_hooks = pt_dpt.hooks  # [0, 6, 9, 12]
     mlx_hooks = [0, 6, 9, 12]
 
     for i, hook_idx in enumerate(mlx_hooks):
-        if hook_idx < len(pt_features) and i < len(mlx_features):
-            pt_f = pt_features[hook_idx]  # Use hook index, not sequential!
-            mlx_f = mlx_features[i]
+        if hook_idx >= len(pt_features) or i >= len(mlx_features):
+            continue
+        pt_f = pt_features[hook_idx]  # Use hook index to access PT feature at that layer
+        mlx_f = mlx_features[i]       # Use sequential index for MLX
 
-            # Reshape if needed (PT is [B,N,C], MLX is [N,C])
-            if len(pt_f.shape) == 3:
-                pt_f = pt_f[0]
+        # Reshape if needed (PT is [B,N,C], MLX is [N,C])
+        if len(pt_f.shape) == 3:
+            pt_f = pt_f[0]
 
-            compare(f"feature[{i}] (PT[{hook_idx}])", pt_f, mlx_f)
+        compare(f"feature[{i}] (hook {hook_idx})", pt_f, mlx_f)
 
     print("\n" + "=" * 70)
     print("COMPARING DPT INTERNAL MODULES")
@@ -208,13 +211,13 @@ def main():
     pt_layers = []
     mlx_layers_spatial = []
 
-    # Use features at hook indices [0, 6, 9, 12]
+    # Use features at hook indices [0, 6, 9, 12] from PT, sequential from MLX
     hook_indices = [0, 6, 9, 12]
     for i, hook_idx in enumerate(hook_indices):
-        if i >= len(mlx_features):
+        if i >= len(mlx_features) or hook_idx >= len(pt_features):
             break
-        pt_f = torch.from_numpy(pt_features[hook_idx]).to("mps")
-        mlx_f = mx.array(mlx_features[i][None, :, :])  # Add batch dim
+        pt_f = torch.from_numpy(pt_features[hook_idx]).to("mps")  # Hook index for PT
+        mlx_f = mx.array(mlx_features[i][None, :, :])  # Sequential index for MLX
 
         # Reshape to spatial
         C = pt_f.shape[-1]

@@ -720,10 +720,11 @@ class Mast3rDecoder(nn.Module):
         x2 = self.decoder_embed(enc_feat2)
 
         # Hooks: [0, 6, 9, 12] - collect features at these indices
-        # Hook 0 = encoder output (before decoder), hooks 6,9,12 = decoder layers
+        # Hook 0 = encoder output AFTER enc_norm (1024 dim), hooks 6,9,12 = decoder layers
+        # NOTE: PyTorch DPT receives enc_norm(encoder_output) for hook 0
         hooks = [0, 6, 9, 12]
-        features1 = [feat1]  # Hook 0: original encoder features (1024 dim)
-        features2 = [feat2]
+        features1 = [enc_feat1]  # Hook 0: encoder features AFTER enc_norm (1024 dim)
+        features2 = [enc_feat2]
 
         # Decoder blocks with cross-attention, collecting hooked outputs
         # IMPORTANT: PyTorch uses OLD x1/x2 for BOTH blocks in each iteration

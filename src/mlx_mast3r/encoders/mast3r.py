@@ -381,8 +381,9 @@ class Mast3rEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, positions)
 
-        # Final norm
-        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=1e-6)
+        # NOTE: enc_norm is NOT applied here - it's applied in the decoder
+        # (like in PyTorch MASt3R where enc_norm is in the decoder, not encoder)
+        # The decoder applies enc_norm before decoder_embed
 
         return x
 
