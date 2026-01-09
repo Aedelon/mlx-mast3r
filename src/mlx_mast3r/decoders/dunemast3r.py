@@ -5,16 +5,22 @@ Copyright (c) 2025 Delanoe Pirard / Aedelon. Apache 2.0 License.
 DuneMASt3R = DUNE Encoder (separate) + MASt3R Decoder (this file)
 
 Architecture:
-- decoder_embed: Project DUNE features to decoder space
+- decoder_embed: Project DUNE features (768/384) to decoder space (768)
 - dec_blocks: 12 transformer decoder blocks (view 1)
 - dec_blocks2: 12 transformer decoder blocks (view 2)
 - downstream_head1/2: DPT heads for 3D points + descriptors
+
+Key differences from MASt3R:
+- encoder_dim = 768 (base) or 384 (small) instead of 1024
+- patch_size = 14 instead of 16
+- DPT act_postprocess[0] input = encoder_dim (768/384)
 
 Optimizations:
 - mx.fast.scaled_dot_product_attention
 - mx.fast.layer_norm
 - mx.compile()
 - FP16/BF16 precision
+- 2D RoPE in decoder attention
 """
 
 from __future__ import annotations
@@ -28,18 +34,35 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+# Import shared components from mast3r decoder
+from mlx_mast3r.decoders.mast3r import (
+    DecoderBlock,
+    DecoderCrossAttention,
+    DecoderMLP,
+    DecoderSelfAttention,
+    DPTHead,
+    FeatureFusionBlock,
+    ResidualConvUnit,
+    apply_rope_2d,
+    bilinear_upsample_2x,
+    nearest_upsample_2x,
+    precompute_rope_2d,
+)
+
 
 @dataclass
-class DuneMast3rConfig:
+class DuneMast3rDecoderConfig:
     """DuneMASt3R decoder configuration."""
 
-    encoder_dim: int = 768  # DUNE Base output dim
+    encoder_dim: int = 768  # DUNE Base output dim (768) or Small (384)
     decoder_dim: int = 768
     num_heads: int = 12
     head_dim: int = 64
     mlp_ratio: float = 4.0
     decoder_depth: int = 12
     patch_size: int = 14  # DUNE uses 14x14 patches
+    output_pts_dim: int = 3  # 3D points
+    output_desc_dim: int = 24  # Descriptor dimension
     precision: Literal["fp32", "fp16", "bf16"] = "fp16"
 
     @property
@@ -51,166 +74,130 @@ class DuneMast3rConfig:
         return int(self.decoder_dim * self.mlp_ratio)
 
     @classmethod
-    def for_dune_base(cls, precision: str = "fp16") -> "DuneMast3rConfig":
+    def for_dune_base(cls, precision: str = "fp16") -> "DuneMast3rDecoderConfig":
         """Config for DUNE Base encoder (768 dim)."""
         return cls(encoder_dim=768, decoder_dim=768, precision=precision)
 
     @classmethod
-    def for_dune_small(cls, precision: str = "fp16") -> "DuneMast3rConfig":
+    def for_dune_small(cls, precision: str = "fp16") -> "DuneMast3rDecoderConfig":
         """Config for DUNE Small encoder (384 dim)."""
         return cls(encoder_dim=384, decoder_dim=768, precision=precision)
 
 
-class DecoderAttention(nn.Module):
-    """Multi-head self-attention for decoder."""
+class DuneDPTHead(nn.Module):
+    """DPT Head adapted for DUNE encoder dimensions.
 
-    def __init__(self, config: DuneMast3rConfig):
+    Same architecture as MASt3R DPT but with encoder_dim=768/384 instead of 1024.
+    """
+
+    def __init__(
+        self,
+        encoder_dim: int = 768,
+        decoder_dim: int = 768,
+        feature_dim: int = 256,
+        num_channels: int = 4,  # pts3d (3) + conf (1)
+        hooks: list[int] | None = None,
+    ):
         super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.feature_dim = feature_dim
+        self.num_channels = num_channels
+        self.hooks = hooks or [0, 6, 9, 12]
 
-        dim = config.decoder_dim
-        self.qkv = nn.Linear(dim, 3 * dim)
-        self.proj = nn.Linear(dim, dim)
+        # Input dimensions: hook 0 = encoder (enc_dim), hooks 1-3 = decoder (dec_dim)
+        in_dims = [encoder_dim, decoder_dim, decoder_dim, decoder_dim]
 
-    def __call__(self, x: mx.array) -> mx.array:
-        B, N, D = x.shape
+        # Layer dims after act_postprocess (same as MASt3R)
+        layer_dims = [96, 192, 384, 768]
 
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = (
-            qkv[:, :, 0].transpose(0, 2, 1, 3),
-            qkv[:, :, 1].transpose(0, 2, 1, 3),
-            qkv[:, :, 2].transpose(0, 2, 1, 3),
+        # act_postprocess: adapt dimensions for each hooked layer
+        # Layer 0: Conv1x1 (encoder_dim->96) + ConvTranspose 4x4 stride 4
+        self.act_postprocess_0_conv = nn.Conv2d(in_dims[0], layer_dims[0], kernel_size=1)
+        self.act_postprocess_0_up = nn.ConvTranspose2d(
+            layer_dims[0], layer_dims[0], kernel_size=4, stride=4, padding=0
         )
 
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
-        return self.proj(out.transpose(0, 2, 1, 3).reshape(B, N, D))
+        # Layer 1: Conv1x1 (768->192) + ConvTranspose 2x2 stride 2
+        self.act_postprocess_1_conv = nn.Conv2d(in_dims[1], layer_dims[1], kernel_size=1)
+        self.act_postprocess_1_up = nn.ConvTranspose2d(
+            layer_dims[1], layer_dims[1], kernel_size=2, stride=2, padding=0
+        )
 
+        # Layer 2: Conv1x1 (768->384) only
+        self.act_postprocess_2_conv = nn.Conv2d(in_dims[2], layer_dims[2], kernel_size=1)
 
-class CrossAttention(nn.Module):
-    """Cross-attention between two views."""
+        # Layer 3: Conv1x1 (768->768) + Conv 3x3 stride 2 (downsample)
+        self.act_postprocess_3_conv = nn.Conv2d(in_dims[3], layer_dims[3], kernel_size=1)
+        self.act_postprocess_3_down = nn.Conv2d(
+            layer_dims[3], layer_dims[3], kernel_size=3, stride=2, padding=1
+        )
 
-    def __init__(self, config: DuneMast3rConfig):
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.scale = 1.0 / math.sqrt(self.head_dim)
+        # scratch.layer_rn: project to feature_dim (256)
+        self.layer1_rn = nn.Conv2d(layer_dims[0], feature_dim, kernel_size=3, padding=1, bias=False)
+        self.layer2_rn = nn.Conv2d(layer_dims[1], feature_dim, kernel_size=3, padding=1, bias=False)
+        self.layer3_rn = nn.Conv2d(layer_dims[2], feature_dim, kernel_size=3, padding=1, bias=False)
+        self.layer4_rn = nn.Conv2d(layer_dims[3], feature_dim, kernel_size=3, padding=1, bias=False)
 
-        dim = config.decoder_dim
-        self.q = nn.Linear(dim, dim)
-        self.kv = nn.Linear(dim, 2 * dim)
-        self.proj = nn.Linear(dim, dim)
+        # scratch.refinenet: multi-scale fusion
+        self.refinenet4 = FeatureFusionBlock(feature_dim)
+        self.refinenet3 = FeatureFusionBlock(feature_dim)
+        self.refinenet2 = FeatureFusionBlock(feature_dim)
+        self.refinenet1 = FeatureFusionBlock(feature_dim)
 
-    def __call__(self, x: mx.array, context: mx.array) -> mx.array:
-        B, N, D = x.shape
-
-        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv(context).reshape(B, -1, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, :, 0].transpose(0, 2, 1, 3), kv[:, :, 1].transpose(0, 2, 1, 3)
-
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
-        return self.proj(out.transpose(0, 2, 1, 3).reshape(B, N, D))
-
-
-class DecoderMLP(nn.Module):
-    """MLP with approximate GELU."""
-
-    def __init__(self, config: DuneMast3rConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.decoder_dim, config.mlp_dim)
-        self.fc2 = nn.Linear(config.mlp_dim, config.decoder_dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu_approx(self.fc1(x)))
-
-
-class DecoderBlock(nn.Module):
-    """Decoder transformer block with self and cross attention."""
-
-    def __init__(self, config: DuneMast3rConfig):
-        super().__init__()
-        dim = config.decoder_dim
-
-        # Self-attention
-        self.norm1_weight = mx.ones((dim,))
-        self.norm1_bias = mx.zeros((dim,))
-        self.self_attn = DecoderAttention(config)
-
-        # Cross-attention
-        self.norm2_weight = mx.ones((dim,))
-        self.norm2_bias = mx.zeros((dim,))
-        self.cross_attn = CrossAttention(config)
-
-        # MLP
-        self.norm3_weight = mx.ones((dim,))
-        self.norm3_bias = mx.zeros((dim,))
-        self.mlp = DecoderMLP(config)
-
-    def __call__(self, x: mx.array, context: mx.array) -> mx.array:
-        # Self-attention
-        normed = mx.fast.layer_norm(x, self.norm1_weight, self.norm1_bias, eps=1e-6)
-        x = x + self.self_attn(normed)
-
-        # Cross-attention
-        normed = mx.fast.layer_norm(x, self.norm2_weight, self.norm2_bias, eps=1e-6)
-        x = x + self.cross_attn(normed, context)
-
-        # MLP
-        normed = mx.fast.layer_norm(x, self.norm3_weight, self.norm3_bias, eps=1e-6)
-        x = x + self.mlp(normed)
-
-        return x
-
-
-class DPTHead(nn.Module):
-    """Dense Prediction Transformer head for 3D points."""
-
-    def __init__(self, config: DuneMast3rConfig, output_dim: int = 3):
-        super().__init__()
-        dim = config.decoder_dim
-
-        # Reassembly layers
-        self.layer1_rn = nn.Conv2d(dim, 256, kernel_size=3, padding=1)
-        self.layer2_rn = nn.Conv2d(dim, 256, kernel_size=3, padding=1)
-        self.layer3_rn = nn.Conv2d(dim, 256, kernel_size=3, padding=1)
-        self.layer4_rn = nn.Conv2d(dim, 256, kernel_size=3, padding=1)
-
-        # Fusion layers
-        self.refinenet1 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.refinenet2 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.refinenet3 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.refinenet4 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-
-        # Output projection
-        self.output_conv1 = nn.Conv2d(256, 128, kernel_size=3, padding=1)
-        self.output_conv2 = nn.Conv2d(128, 32, kernel_size=3, padding=1)
-        self.output_conv3 = nn.Conv2d(32, output_dim, kernel_size=1)
+        # Output head
+        last_dim = feature_dim // 2  # 128
+        self.head_conv1 = nn.Conv2d(feature_dim, last_dim, kernel_size=3, padding=1)
+        self.head_conv2 = nn.Conv2d(last_dim, last_dim, kernel_size=3, padding=1)
+        self.head_conv3 = nn.Conv2d(last_dim, num_channels, kernel_size=1)
 
     def __call__(self, features: list[mx.array], H: int, W: int) -> mx.array:
-        """
+        """Process multi-scale features through DPT.
+
         Args:
-            features: List of 4 feature maps at different scales
-            H, W: Output spatial dimensions
+            features: List of [B, N, C] features at hooked layers
+            H, W: Patch grid dimensions
 
         Returns:
-            [B, H, W, output_dim] predictions
+            [B, H*14, W*14, num_channels] - full resolution for patch_size=14
         """
-        # This is a simplified DPT - full implementation would include
-        # proper multi-scale fusion with upsampling
         B = features[0].shape[0]
 
-        # Reshape to spatial
-        x = features[-1].reshape(B, H, W, -1)
+        # Reshape features to spatial: [B, N, C] -> [B, H, W, C]
+        layers = [f.reshape(B, H, W, -1) for f in features]
 
-        # Simple conv processing
-        x = nn.relu(self.layer4_rn(x))
-        x = nn.relu(self.refinenet4(x))
-        x = nn.relu(self.output_conv1(x))
-        x = nn.relu(self.output_conv2(x))
-        x = self.output_conv3(x)
+        # Apply act_postprocess
+        l0 = self.act_postprocess_0_conv(layers[0])
+        l0 = self.act_postprocess_0_up(l0)
 
-        return x
+        l1 = self.act_postprocess_1_conv(layers[1])
+        l1 = self.act_postprocess_1_up(l1)
+
+        l2 = self.act_postprocess_2_conv(layers[2])
+
+        l3 = self.act_postprocess_3_conv(layers[3])
+        l3 = self.act_postprocess_3_down(l3)
+
+        # Project to feature_dim
+        l0 = self.layer1_rn(l0)
+        l1 = self.layer2_rn(l1)
+        l2 = self.layer3_rn(l2)
+        l3 = self.layer4_rn(l3)
+
+        # Multi-scale fusion
+        path_4 = self.refinenet4(l3)
+        path_4 = path_4[:, : l2.shape[1], : l2.shape[2], :]
+
+        path_3 = self.refinenet3(path_4, l2)
+        path_2 = self.refinenet2(path_3, l1)
+        path_1 = self.refinenet1(path_2, l0)
+
+        # Output head
+        out = self.head_conv1(path_1)
+        out = bilinear_upsample_2x(out, align_corners=True)
+        out = self.head_conv2(out)
+        out = nn.relu(out)
+        out = self.head_conv3(out)
+
+        return out
 
 
 class DuneMast3rDecoder(nn.Module):
@@ -221,40 +208,103 @@ class DuneMast3rDecoder(nn.Module):
     - Confidence maps
     - Dense descriptors for matching
 
-    Example:
-        >>> config = DuneMast3rConfig.for_dune_base(precision="fp16")
-        >>> decoder = DuneMast3rDecoder(config)
-        >>> decoder.load("path/to/dunemast3r_vitbase.pth")
-        >>> pts3d, conf, desc = decoder(feat1, feat2, shape1, shape2)
+    Architecture follows MASt3R with:
+    - Cross-attention between views
+    - 2D RoPE positional encoding
+    - DPT heads for dense prediction
     """
 
-    def __init__(self, config: DuneMast3rConfig):
+    def __init__(self, config: DuneMast3rDecoderConfig):
         super().__init__()
         self.config = config
 
         # Project encoder features to decoder dim
         self.decoder_embed = nn.Linear(config.encoder_dim, config.decoder_dim)
 
-        # Encoder norm (applied to DUNE output)
+        # Encoder norm (applied to DUNE encoder output)
         self.enc_norm_weight = mx.ones((config.encoder_dim,))
         self.enc_norm_bias = mx.zeros((config.encoder_dim,))
 
-        # Mask token for missing regions
+        # Mask token for masked regions
         self.mask_token = mx.zeros((1, 1, config.decoder_dim))
 
-        # Decoder blocks for view 1
-        self.dec_blocks = [DecoderBlock(config) for _ in range(config.decoder_depth)]
+        # Import config type for decoder blocks
+        from mlx_mast3r.decoders.mast3r import Mast3rDecoderConfig
 
-        # Decoder blocks for view 2
-        self.dec_blocks2 = [DecoderBlock(config) for _ in range(config.decoder_depth)]
+        # Create a compatible config for DecoderBlock
+        block_config = Mast3rDecoderConfig(
+            encoder_dim=config.encoder_dim,
+            decoder_dim=config.decoder_dim,
+            num_heads=config.num_heads,
+            head_dim=config.head_dim,
+            mlp_ratio=config.mlp_ratio,
+            decoder_depth=config.decoder_depth,
+            patch_size=config.patch_size,
+            precision=config.precision,
+        )
 
-        # Decoder norm
+        # Decoder blocks for view 1 (with RoPE)
+        self.dec_blocks = [
+            DecoderBlock(block_config, use_rope=True) for _ in range(config.decoder_depth)
+        ]
+
+        # Decoder blocks for view 2 (with RoPE)
+        self.dec_blocks2 = [
+            DecoderBlock(block_config, use_rope=True) for _ in range(config.decoder_depth)
+        ]
+
+        # Final decoder norm
         self.dec_norm_weight = mx.ones((config.decoder_dim,))
         self.dec_norm_bias = mx.zeros((config.decoder_dim,))
 
-        # Output heads
-        self.head1 = DPTHead(config, output_dim=3 + 1 + 24)  # pts3d + conf + desc
-        self.head2 = DPTHead(config, output_dim=3 + 1 + 24)
+        # Output heads: pts3d (3) + confidence (1) = 4 channels
+        self.head1 = DuneDPTHead(
+            encoder_dim=config.encoder_dim,
+            decoder_dim=config.decoder_dim,
+            feature_dim=256,
+            num_channels=4,
+        )
+        self.head2 = DuneDPTHead(
+            encoder_dim=config.encoder_dim,
+            decoder_dim=config.decoder_dim,
+            feature_dim=256,
+            num_channels=4,
+        )
+
+        # Local features MLP (descriptors)
+        # Input: enc_dim + dec_dim (768+768=1536 for base, 384+768=1152 for small)
+        # Output: (desc_dim + 1) * patch_size^2 = 25 * 196 = 4900
+        idim = config.encoder_dim + config.decoder_dim
+        self.head_local_features1 = nn.Sequential(
+            nn.Linear(idim, idim * 4),
+            nn.GELU(),
+            nn.Linear(idim * 4, (config.output_desc_dim + 1) * config.patch_size**2),
+        )
+        self.head_local_features2 = nn.Sequential(
+            nn.Linear(idim, idim * 4),
+            nn.GELU(),
+            nn.Linear(idim * 4, (config.output_desc_dim + 1) * config.patch_size**2),
+        )
+
+        # RoPE tables
+        self._rope_cos: mx.array | None = None
+        self._rope_sin: mx.array | None = None
+        self._rope_positions: mx.array | None = None
+
+    def _init_rope(self, H: int, W: int) -> None:
+        """Initialize RoPE tables for patch grid."""
+        cos, sin, positions = precompute_rope_2d(
+            H, W, self.config.head_dim, theta=100.0, dtype=self.config.dtype
+        )
+        self._rope_cos = cos
+        self._rope_sin = sin
+        self._rope_positions = positions
+
+        # Propagate to all decoder blocks
+        for blk in self.dec_blocks:
+            blk.set_rope_tables(cos, sin, positions)
+        for blk in self.dec_blocks2:
+            blk.set_rope_tables(cos, sin, positions)
 
     def __call__(
         self,
@@ -266,10 +316,10 @@ class DuneMast3rDecoder(nn.Module):
         """Forward pass.
 
         Args:
-            feat1: [B, N1, D] encoder features for view 1
+            feat1: [B, N1, D] encoder features for view 1 (D=768 or 384)
             feat2: [B, N2, D] encoder features for view 2
-            shape1: (H1, W1) spatial shape for view 1
-            shape2: (H2, W2) spatial shape for view 2
+            shape1: (H1, W1) patch grid shape for view 1
+            shape2: (H2, W2) patch grid shape for view 2
 
         Returns:
             (output1, output2) dicts with keys: pts3d, conf, desc
@@ -278,40 +328,122 @@ class DuneMast3rDecoder(nn.Module):
         H1, W1 = shape1
         H2, W2 = shape2
 
-        # Normalize encoder outputs
-        feat1 = mx.fast.layer_norm(feat1, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
-        feat2 = mx.fast.layer_norm(feat2, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
+        # Initialize RoPE if needed
+        if self._rope_cos is None:
+            self._init_rope(H1, W1)
+
+        # Normalize encoder outputs (keep original for hooks)
+        enc_feat1 = mx.fast.layer_norm(feat1, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
+        enc_feat2 = mx.fast.layer_norm(feat2, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
 
         # Project to decoder dim
-        x1 = self.decoder_embed(feat1)
-        x2 = self.decoder_embed(feat2)
+        x1 = self.decoder_embed(enc_feat1)
+        x2 = self.decoder_embed(enc_feat2)
 
-        # Decoder blocks with cross-attention
-        for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
-            x1 = blk1(x1, x2)  # View 1 attends to view 2
-            x2 = blk2(x2, x1)  # View 2 attends to view 1
+        # Hooks: [0, 6, 9, 12] - collect features at these indices
+        # Hook 0 = encoder output AFTER enc_norm
+        hooks = [0, 6, 9, 12]
+        features1 = [enc_feat1]  # Hook 0: encoder features AFTER enc_norm
+        features2 = [enc_feat2]
+
+        # Decoder blocks with cross-attention, collecting hooked outputs
+        # IMPORTANT: PyTorch uses OLD x1/x2 for BOTH blocks in each iteration
+        for i, (blk1, blk2) in enumerate(zip(self.dec_blocks, self.dec_blocks2)):
+            x1_old, x2_old = x1, x2
+            x1 = blk1(x1_old, x2_old)  # View 1 attends to view 2 (old)
+            x2 = blk2(x2_old, x1_old)  # View 2 attends to view 1 (old)
+
+            # Collect at hooks
+            layer_idx = i + 1
+            if layer_idx in hooks[1:]:
+                features1.append(x1)
+                features2.append(x2)
 
         # Final norm
-        x1 = mx.fast.layer_norm(x1, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
-        x2 = mx.fast.layer_norm(x2, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
+        x1_norm = mx.fast.layer_norm(x1, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
+        x2_norm = mx.fast.layer_norm(x2, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
 
-        # DPT heads
-        out1 = self.head1([x1], H1, W1)  # [B, H1, W1, 28]
-        out2 = self.head2([x2], H2, W2)  # [B, H2, W2, 28]
+        # Update final layer features with normed version
+        if len(features1) == 4:
+            features1[-1] = x1_norm
+            features2[-1] = x2_norm
 
-        # Split outputs
-        def split_output(x: mx.array) -> dict:
-            return {
-                "pts3d": x[..., :3],
-                "conf": x[..., 3:4],
-                "desc": x[..., 4:],
-            }
+        # DPT heads for pts3d + conf
+        dpt_out1 = self.head1(features1, H1, W1)
+        dpt_out2 = self.head2(features2, H2, W2)
 
-        return split_output(out1), split_output(out2)
+        # Local features via MLP (for descriptors)
+        cat1 = mx.concatenate([feat1, x1_norm], axis=-1)
+        cat2 = mx.concatenate([feat2, x2_norm], axis=-1)
+
+        # MLP
+        local_feat1 = self.head_local_features1(cat1)
+        local_feat2 = self.head_local_features2(cat2)
+
+        # Pixel shuffle to get full resolution descriptors
+        ps = self.config.patch_size  # 14
+        desc_dim = self.config.output_desc_dim + 1  # 25
+
+        # Reshape: [B, H*W, desc_dim*ps*ps] -> [B, H, W, desc_dim, ps, ps]
+        local_feat1 = local_feat1.reshape(B, H1, W1, desc_dim, ps, ps)
+        local_feat2 = local_feat2.reshape(B, H2, W2, desc_dim, ps, ps)
+
+        # Transpose and reshape for pixel shuffle
+        local_feat1 = local_feat1.transpose(0, 1, 4, 2, 5, 3).reshape(B, H1 * ps, W1 * ps, desc_dim)
+        local_feat2 = local_feat2.transpose(0, 1, 4, 2, 5, 3).reshape(B, H2 * ps, W2 * ps, desc_dim)
+
+        # Split descriptors and desc_conf
+        desc1 = local_feat1[..., : self.config.output_desc_dim]
+        desc_conf1 = local_feat1[..., self.config.output_desc_dim :]
+        desc2 = local_feat2[..., : self.config.output_desc_dim]
+        desc_conf2 = local_feat2[..., self.config.output_desc_dim :]
+
+        # Normalize descriptors
+        desc1 = desc1 / (mx.linalg.norm(desc1, axis=-1, keepdims=True) + 1e-8)
+        desc2 = desc2 / (mx.linalg.norm(desc2, axis=-1, keepdims=True) + 1e-8)
+
+        # Post-processing (matching MASt3R depth_mode='exp', conf_mode='exp')
+        def postprocess_pts3d(xyz: mx.array) -> mx.array:
+            """Apply depth_mode='exp': pts3d = xyz * expm1(norm(xyz))."""
+            d = mx.linalg.norm(xyz, axis=-1, keepdims=True)
+            xyz_normalized = xyz / mx.maximum(d, mx.array(1e-8))
+            return xyz_normalized * mx.expm1(d)
+
+        def postprocess_conf(x: mx.array, vmin: float = 1.0) -> mx.array:
+            """Apply conf_mode='exp': conf = vmin + exp(x)."""
+            return vmin + mx.exp(x)
+
+        def postprocess_desc_conf(x: mx.array, vmin: float = 0.0) -> mx.array:
+            """Apply desc_conf_mode='exp': desc_conf = vmin + exp(x)."""
+            return vmin + mx.exp(x)
+
+        # Apply post-processing
+        pts3d_1 = postprocess_pts3d(dpt_out1[..., :3])
+        pts3d_2 = postprocess_pts3d(dpt_out2[..., :3])
+        conf_1 = postprocess_conf(dpt_out1[..., 3:4])
+        conf_2 = postprocess_conf(dpt_out2[..., 3:4])
+        desc_conf1 = postprocess_desc_conf(desc_conf1)
+        desc_conf2 = postprocess_desc_conf(desc_conf2)
+
+        # Build output dicts
+        out1 = {
+            "pts3d": pts3d_1,
+            "conf": conf_1,
+            "desc": desc1,
+            "desc_conf": desc_conf1,
+        }
+        out2 = {
+            "pts3d": pts3d_2,
+            "conf": conf_2,
+            "desc": desc2,
+            "desc_conf": desc_conf2,
+        }
+
+        return out1, out2
 
 
-class DuneMast3rEngine:
-    """High-level DuneMASt3R pipeline: DUNE encoder + decoder."""
+class DuneMast3rDecoderEngine:
+    """High-level DuneMASt3R decoder engine with weight loading."""
 
     def __init__(
         self,
@@ -320,19 +452,19 @@ class DuneMast3rEngine:
         precision: Literal["fp32", "fp16", "bf16"] = "fp16",
         compile: bool = True,
     ):
-        from mlx_mast3r.encoders import DuneEncoder, DuneConfig
+        from mlx_mast3r.encoders.dune import DuneConfig, DuneEncoder
 
-        # Encoder
+        # Encoder config
         self.encoder_config = DuneConfig(
             variant=encoder_variant, resolution=resolution, precision=precision
         )
         self.encoder = DuneEncoder(self.encoder_config)
 
-        # Decoder
+        # Decoder config
         if encoder_variant == "base":
-            self.decoder_config = DuneMast3rConfig.for_dune_base(precision)
+            self.decoder_config = DuneMast3rDecoderConfig.for_dune_base(precision)
         else:
-            self.decoder_config = DuneMast3rConfig.for_dune_small(precision)
+            self.decoder_config = DuneMast3rDecoderConfig.for_dune_small(precision)
 
         self.decoder = DuneMast3rDecoder(self.decoder_config)
 
@@ -342,7 +474,7 @@ class DuneMast3rEngine:
         self._loaded = False
 
     def load(self, encoder_path: str | Path, decoder_path: str | Path) -> None:
-        """Load encoder and decoder weights."""
+        """Load encoder and decoder weights from safetensors files."""
         # Load encoder
         from mlx_mast3r.encoders.dune import DuneEncoderEngine
 
@@ -350,6 +482,7 @@ class DuneMast3rEngine:
             variant=self.encoder_config.variant,
             resolution=self.encoder_config.resolution,
             precision=self.encoder_config.precision,
+            compile=False,
         )
         enc_engine.load(encoder_path)
         self.encoder = enc_engine.model
@@ -365,107 +498,279 @@ class DuneMast3rEngine:
         self._loaded = True
 
     def _load_decoder(self, path: str | Path) -> None:
-        """Load decoder weights from PyTorch checkpoint."""
-        import torch
+        """Load decoder weights from safetensors.
 
-        ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
-        state_dict = ckpt["model"]
+        The decoder.safetensors has keys prefixed with 'mast3r.' like:
+        - mast3r.dec_blocks.X.*
+        - mast3r.downstream_head1.*
+        - mast3r.decoder_embed.*
+        """
+        from safetensors import safe_open
+
+        path = Path(path)
 
         weights = {}
+        with safe_open(str(path), framework="numpy") as f:
+            keys = list(f.keys())
 
-        # decoder_embed
-        weights["decoder_embed.weight"] = mx.array(
-            state_dict["mast3r.decoder_embed.weight"].numpy()
-        )
-        weights["decoder_embed.bias"] = mx.array(state_dict["mast3r.decoder_embed.bias"].numpy())
+            # decoder_embed
+            if "mast3r.decoder_embed.weight" in keys:
+                weights["decoder_embed.weight"] = mx.array(
+                    f.get_tensor("mast3r.decoder_embed.weight")
+                )
+                weights["decoder_embed.bias"] = mx.array(f.get_tensor("mast3r.decoder_embed.bias"))
 
-        # enc_norm
-        weights["enc_norm_weight"] = mx.array(state_dict["mast3r.enc_norm.weight"].numpy())
-        weights["enc_norm_bias"] = mx.array(state_dict["mast3r.enc_norm.bias"].numpy())
+            # enc_norm
+            if "mast3r.enc_norm.weight" in keys:
+                weights["enc_norm_weight"] = mx.array(f.get_tensor("mast3r.enc_norm.weight"))
+                weights["enc_norm_bias"] = mx.array(f.get_tensor("mast3r.enc_norm.bias"))
 
-        # mask_token
-        weights["mask_token"] = mx.array(state_dict["mast3r.mask_token"].numpy())
+            # dec_norm
+            if "mast3r.dec_norm.weight" in keys:
+                weights["dec_norm_weight"] = mx.array(f.get_tensor("mast3r.dec_norm.weight"))
+                weights["dec_norm_bias"] = mx.array(f.get_tensor("mast3r.dec_norm.bias"))
 
-        # dec_norm
-        weights["dec_norm_weight"] = mx.array(state_dict["mast3r.dec_norm.weight"].numpy())
-        weights["dec_norm_bias"] = mx.array(state_dict["mast3r.dec_norm.bias"].numpy())
+            # mask_token
+            if "mast3r.mask_token" in keys:
+                weights["mask_token"] = mx.array(f.get_tensor("mast3r.mask_token"))
 
-        # Decoder blocks
-        for i in range(self.decoder_config.decoder_depth):
-            prefix_src = f"mast3r.dec_blocks.{i}."
-            prefix_dst = f"dec_blocks.{i}."
+            # Load decoder blocks
+            def load_decoder_block(src_prefix: str, dst_prefix: str) -> None:
+                """Load a single decoder block."""
+                if f"{src_prefix}norm1.weight" not in keys:
+                    return
 
-            # Self-attention
-            weights[f"{prefix_dst}norm1_weight"] = mx.array(
-                state_dict[f"{prefix_src}norm1.weight"].numpy()
-            )
-            weights[f"{prefix_dst}norm1_bias"] = mx.array(
-                state_dict[f"{prefix_src}norm1.bias"].numpy()
-            )
-            weights[f"{prefix_dst}self_attn.qkv.weight"] = mx.array(
-                state_dict[f"{prefix_src}attn.qkv.weight"].numpy()
-            )
-            weights[f"{prefix_dst}self_attn.qkv.bias"] = mx.array(
-                state_dict[f"{prefix_src}attn.qkv.bias"].numpy()
-            )
-            weights[f"{prefix_dst}self_attn.proj.weight"] = mx.array(
-                state_dict[f"{prefix_src}attn.proj.weight"].numpy()
-            )
-            weights[f"{prefix_dst}self_attn.proj.bias"] = mx.array(
-                state_dict[f"{prefix_src}attn.proj.bias"].numpy()
-            )
-
-            # Cross-attention (if present in checkpoint)
-            if f"{prefix_src}cross_attn.q.weight" in state_dict:
-                weights[f"{prefix_dst}norm2_weight"] = mx.array(
-                    state_dict[f"{prefix_src}norm2.weight"].numpy()
+                # Self-attention norms
+                weights[f"{dst_prefix}norm1_weight"] = mx.array(
+                    f.get_tensor(f"{src_prefix}norm1.weight")
                 )
-                weights[f"{prefix_dst}norm2_bias"] = mx.array(
-                    state_dict[f"{prefix_src}norm2.bias"].numpy()
-                )
-                weights[f"{prefix_dst}cross_attn.q.weight"] = mx.array(
-                    state_dict[f"{prefix_src}cross_attn.q.weight"].numpy()
-                )
-                weights[f"{prefix_dst}cross_attn.q.bias"] = mx.array(
-                    state_dict[f"{prefix_src}cross_attn.q.bias"].numpy()
-                )
-                weights[f"{prefix_dst}cross_attn.kv.weight"] = mx.array(
-                    state_dict[f"{prefix_src}cross_attn.kv.weight"].numpy()
-                )
-                weights[f"{prefix_dst}cross_attn.kv.bias"] = mx.array(
-                    state_dict[f"{prefix_src}cross_attn.kv.bias"].numpy()
-                )
-                weights[f"{prefix_dst}cross_attn.proj.weight"] = mx.array(
-                    state_dict[f"{prefix_src}cross_attn.proj.weight"].numpy()
-                )
-                weights[f"{prefix_dst}cross_attn.proj.bias"] = mx.array(
-                    state_dict[f"{prefix_src}cross_attn.proj.bias"].numpy()
+                weights[f"{dst_prefix}norm1_bias"] = mx.array(
+                    f.get_tensor(f"{src_prefix}norm1.bias")
                 )
 
-            # MLP
-            weights[f"{prefix_dst}norm3_weight"] = mx.array(
-                state_dict[f"{prefix_src}norm2.weight"].numpy()
-            )
-            weights[f"{prefix_dst}norm3_bias"] = mx.array(
-                state_dict[f"{prefix_src}norm2.bias"].numpy()
-            )
-            weights[f"{prefix_dst}mlp.fc1.weight"] = mx.array(
-                state_dict[f"{prefix_src}mlp.fc1.weight"].numpy()
-            )
-            weights[f"{prefix_dst}mlp.fc1.bias"] = mx.array(
-                state_dict[f"{prefix_src}mlp.fc1.bias"].numpy()
-            )
-            weights[f"{prefix_dst}mlp.fc2.weight"] = mx.array(
-                state_dict[f"{prefix_src}mlp.fc2.weight"].numpy()
-            )
-            weights[f"{prefix_dst}mlp.fc2.bias"] = mx.array(
-                state_dict[f"{prefix_src}mlp.fc2.bias"].numpy()
-            )
+                # Self-attention
+                weights[f"{dst_prefix}self_attn.qkv.weight"] = mx.array(
+                    f.get_tensor(f"{src_prefix}attn.qkv.weight")
+                )
+                weights[f"{dst_prefix}self_attn.qkv.bias"] = mx.array(
+                    f.get_tensor(f"{src_prefix}attn.qkv.bias")
+                )
+                weights[f"{dst_prefix}self_attn.proj.weight"] = mx.array(
+                    f.get_tensor(f"{src_prefix}attn.proj.weight")
+                )
+                weights[f"{dst_prefix}self_attn.proj.bias"] = mx.array(
+                    f.get_tensor(f"{src_prefix}attn.proj.bias")
+                )
+
+                # Cross-attention norms
+                if f"{src_prefix}norm2.weight" in keys:
+                    weights[f"{dst_prefix}norm2_weight"] = mx.array(
+                        f.get_tensor(f"{src_prefix}norm2.weight")
+                    )
+                    weights[f"{dst_prefix}norm2_bias"] = mx.array(
+                        f.get_tensor(f"{src_prefix}norm2.bias")
+                    )
+
+                if f"{src_prefix}norm_y.weight" in keys:
+                    weights[f"{dst_prefix}norm_y_weight"] = mx.array(
+                        f.get_tensor(f"{src_prefix}norm_y.weight")
+                    )
+                    weights[f"{dst_prefix}norm_y_bias"] = mx.array(
+                        f.get_tensor(f"{src_prefix}norm_y.bias")
+                    )
+
+                # Cross-attention - projq/projk/projv -> q + kv
+                cross_key = f"{src_prefix}cross_attn.projq.weight"
+                if cross_key in keys:
+                    weights[f"{dst_prefix}cross_attn.q.weight"] = mx.array(
+                        f.get_tensor(f"{src_prefix}cross_attn.projq.weight")
+                    )
+                    weights[f"{dst_prefix}cross_attn.q.bias"] = mx.array(
+                        f.get_tensor(f"{src_prefix}cross_attn.projq.bias")
+                    )
+
+                    # Combine K and V into KV
+                    k_weight = f.get_tensor(f"{src_prefix}cross_attn.projk.weight")
+                    v_weight = f.get_tensor(f"{src_prefix}cross_attn.projv.weight")
+                    kv_weight = np.concatenate([k_weight, v_weight], axis=0)
+                    weights[f"{dst_prefix}cross_attn.kv.weight"] = mx.array(kv_weight)
+
+                    k_bias = f.get_tensor(f"{src_prefix}cross_attn.projk.bias")
+                    v_bias = f.get_tensor(f"{src_prefix}cross_attn.projv.bias")
+                    kv_bias = np.concatenate([k_bias, v_bias], axis=0)
+                    weights[f"{dst_prefix}cross_attn.kv.bias"] = mx.array(kv_bias)
+
+                    weights[f"{dst_prefix}cross_attn.proj.weight"] = mx.array(
+                        f.get_tensor(f"{src_prefix}cross_attn.proj.weight")
+                    )
+                    weights[f"{dst_prefix}cross_attn.proj.bias"] = mx.array(
+                        f.get_tensor(f"{src_prefix}cross_attn.proj.bias")
+                    )
+
+                # MLP norm (norm3)
+                if f"{src_prefix}norm3.weight" in keys:
+                    weights[f"{dst_prefix}norm3_weight"] = mx.array(
+                        f.get_tensor(f"{src_prefix}norm3.weight")
+                    )
+                    weights[f"{dst_prefix}norm3_bias"] = mx.array(
+                        f.get_tensor(f"{src_prefix}norm3.bias")
+                    )
+
+                # MLP
+                weights[f"{dst_prefix}mlp.fc1.weight"] = mx.array(
+                    f.get_tensor(f"{src_prefix}mlp.fc1.weight")
+                )
+                weights[f"{dst_prefix}mlp.fc1.bias"] = mx.array(
+                    f.get_tensor(f"{src_prefix}mlp.fc1.bias")
+                )
+                weights[f"{dst_prefix}mlp.fc2.weight"] = mx.array(
+                    f.get_tensor(f"{src_prefix}mlp.fc2.weight")
+                )
+                weights[f"{dst_prefix}mlp.fc2.bias"] = mx.array(
+                    f.get_tensor(f"{src_prefix}mlp.fc2.bias")
+                )
+
+            # Load all decoder blocks
+            for i in range(self.decoder_config.decoder_depth):
+                load_decoder_block(f"mast3r.dec_blocks.{i}.", f"dec_blocks.{i}.")
+                load_decoder_block(f"mast3r.dec_blocks2.{i}.", f"dec_blocks2.{i}.")
+
+            # Helper to transpose conv weights from PyTorch to MLX
+            def transpose_conv_weight(w):
+                """PyTorch (O,I,H,W) -> MLX (O,H,W,I)."""
+                return np.transpose(w, (0, 2, 3, 1))
+
+            # Load DPT heads
+            def load_dpt_head(src_head: str, dst_head: str) -> None:
+                """Load DPT head weights."""
+                # act_postprocess layers
+                if f"{src_head}.dpt.act_postprocess.0.0.weight" in keys:
+                    weights[f"{dst_head}.act_postprocess_0_conv.weight"] = mx.array(
+                        transpose_conv_weight(
+                            f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.weight")
+                        )
+                    )
+                    weights[f"{dst_head}.act_postprocess_0_conv.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.bias")
+                    )
+                    # ConvTranspose: PyTorch (I,O,H,W) -> MLX (O,H,W,I)
+                    ct_w = f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.weight")
+                    weights[f"{dst_head}.act_postprocess_0_up.weight"] = mx.array(
+                        np.transpose(ct_w, (1, 2, 3, 0))
+                    )
+                    weights[f"{dst_head}.act_postprocess_0_up.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.bias")
+                    )
+
+                if f"{src_head}.dpt.act_postprocess.1.0.weight" in keys:
+                    weights[f"{dst_head}.act_postprocess_1_conv.weight"] = mx.array(
+                        transpose_conv_weight(
+                            f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.weight")
+                        )
+                    )
+                    weights[f"{dst_head}.act_postprocess_1_conv.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.bias")
+                    )
+                    ct_w = f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.weight")
+                    weights[f"{dst_head}.act_postprocess_1_up.weight"] = mx.array(
+                        np.transpose(ct_w, (1, 2, 3, 0))
+                    )
+                    weights[f"{dst_head}.act_postprocess_1_up.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.bias")
+                    )
+
+                if f"{src_head}.dpt.act_postprocess.2.0.weight" in keys:
+                    weights[f"{dst_head}.act_postprocess_2_conv.weight"] = mx.array(
+                        transpose_conv_weight(
+                            f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.weight")
+                        )
+                    )
+                    weights[f"{dst_head}.act_postprocess_2_conv.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.bias")
+                    )
+
+                if f"{src_head}.dpt.act_postprocess.3.0.weight" in keys:
+                    weights[f"{dst_head}.act_postprocess_3_conv.weight"] = mx.array(
+                        transpose_conv_weight(
+                            f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.weight")
+                        )
+                    )
+                    weights[f"{dst_head}.act_postprocess_3_conv.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.bias")
+                    )
+                    weights[f"{dst_head}.act_postprocess_3_down.weight"] = mx.array(
+                        transpose_conv_weight(
+                            f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.weight")
+                        )
+                    )
+                    weights[f"{dst_head}.act_postprocess_3_down.bias"] = mx.array(
+                        f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.bias")
+                    )
+
+                # layer_rn (try both naming conventions)
+                for i in range(1, 5):
+                    layer_key = f"{src_head}.dpt.scratch.layer{i}_rn.weight"
+                    if layer_key in keys:
+                        weights[f"{dst_head}.layer{i}_rn.weight"] = mx.array(
+                            transpose_conv_weight(f.get_tensor(layer_key))
+                        )
+
+                # refinenet
+                for i in range(1, 5):
+                    refine_prefix = f"{src_head}.dpt.scratch.refinenet{i}"
+                    dst_refine = f"{dst_head}.refinenet{i}"
+
+                    if f"{refine_prefix}.out_conv.weight" in keys:
+                        weights[f"{dst_refine}.out_conv.weight"] = mx.array(
+                            transpose_conv_weight(f.get_tensor(f"{refine_prefix}.out_conv.weight"))
+                        )
+                        weights[f"{dst_refine}.out_conv.bias"] = mx.array(
+                            f.get_tensor(f"{refine_prefix}.out_conv.bias")
+                        )
+
+                    for unit in ["resConfUnit1", "resConfUnit2"]:
+                        for conv in ["conv1", "conv2"]:
+                            w_key = f"{refine_prefix}.{unit}.{conv}.weight"
+                            if w_key in keys:
+                                weights[f"{dst_refine}.{unit}.{conv}.weight"] = mx.array(
+                                    transpose_conv_weight(f.get_tensor(w_key))
+                                )
+                                weights[f"{dst_refine}.{unit}.{conv}.bias"] = mx.array(
+                                    f.get_tensor(f"{refine_prefix}.{unit}.{conv}.bias")
+                                )
+
+                # head: output convolutions
+                head_map = [("0", "head_conv1"), ("2", "head_conv2"), ("4", "head_conv3")]
+                for src_idx, dst_name in head_map:
+                    w_key = f"{src_head}.dpt.head.{src_idx}.weight"
+                    if w_key in keys:
+                        weights[f"{dst_head}.{dst_name}.weight"] = mx.array(
+                            transpose_conv_weight(f.get_tensor(w_key))
+                        )
+                        weights[f"{dst_head}.{dst_name}.bias"] = mx.array(
+                            f.get_tensor(f"{src_head}.dpt.head.{src_idx}.bias")
+                        )
+
+            # Load both DPT heads
+            load_dpt_head("mast3r.downstream_head1", "head1")
+            load_dpt_head("mast3r.downstream_head2", "head2")
+
+            # Load local features MLP
+            for head_idx in [1, 2]:
+                src = f"mast3r.downstream_head{head_idx}.head_local_features"
+                dst = f"head_local_features{head_idx}"
+
+                if f"{src}.fc1.weight" in keys:
+                    weights[f"{dst}.layers.0.weight"] = mx.array(f.get_tensor(f"{src}.fc1.weight"))
+                    weights[f"{dst}.layers.0.bias"] = mx.array(f.get_tensor(f"{src}.fc1.bias"))
+                    weights[f"{dst}.layers.2.weight"] = mx.array(f.get_tensor(f"{src}.fc2.weight"))
+                    weights[f"{dst}.layers.2.bias"] = mx.array(f.get_tensor(f"{src}.fc2.bias"))
 
         # Cast to dtype
         if self.decoder_config.dtype != mx.float32:
             weights = {k: v.astype(self.decoder_config.dtype) for k, v in weights.items()}
 
+        print(f"Loading {len(weights)} decoder weights...")
         self.decoder.load_weights(list(weights.items()), strict=False)
         mx.eval(self.decoder.parameters())
 
@@ -477,8 +782,8 @@ class DuneMast3rEngine:
         """Run full pipeline.
 
         Args:
-            img1: [B, H, W, 3] first view image (NHWC)
-            img2: [B, H, W, 3] second view image (NHWC)
+            img1: [B, H, W, 3] first view image (NHWC, normalized)
+            img2: [B, H, W, 3] second view image
 
         Returns:
             (output1, output2) with pts3d, conf, desc for each view
@@ -517,9 +822,12 @@ class DuneMast3rEngine:
         """
         import time
 
-        # Preprocess
-        x1 = img1.astype(np.float32) / 127.5 - 1.0
-        x2 = img2.astype(np.float32) / 127.5 - 1.0
+        # DUNE preprocessing (same as MASt3R)
+        x1 = img1.astype(np.float32) / 255.0
+        x1 = (x1 - 0.5) / 0.5
+        x2 = img2.astype(np.float32) / 255.0
+        x2 = (x2 - 0.5) / 0.5
+
         x1 = mx.array(x1[None, :, :, :])
         x2 = mx.array(x2[None, :, :, :])
 
@@ -533,3 +841,17 @@ class DuneMast3rEngine:
         out2_np = {k: np.array(v[0]) for k, v in out2.items()}
 
         return out1_np, out2_np, ms
+
+    def warmup(self, iterations: int = 5) -> None:
+        """Warmup the model."""
+        H, W = self.encoder_config.img_h, self.encoder_config.img_w
+        dummy = mx.zeros((1, H, W, 3), dtype=mx.float32)
+
+        for _ in range(iterations):
+            out1, out2 = self(dummy, dummy)
+            mx.eval(out1["pts3d"], out2["pts3d"])
+
+
+# Backward compatibility aliases
+DuneMast3rConfig = DuneMast3rDecoderConfig
+DuneMast3rEngine = DuneMast3rDecoderEngine
