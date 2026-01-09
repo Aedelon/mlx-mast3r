@@ -338,7 +338,24 @@ def benchmark_mast3r_encoder() -> dict:
             features, ms = mlx_engine.infer(img)
             mlx_times.append(ms)
 
-        mlx_features = features
+        # Apply enc_norm to match PyTorch _encode_image output
+        # Note: PyTorch _encode_image returns features AFTER enc_norm
+        # but MLX encoder returns features BEFORE enc_norm (decoder applies it)
+        from safetensors import safe_open
+        import mlx.core as mx
+
+        safetensors_path = SAFETENSORS_DIR / "mast3r_vit_large" / "unified.safetensors"
+        with safe_open(str(safetensors_path), framework="numpy") as f:
+            enc_norm_weight = mx.array(f.get_tensor("enc_norm.weight"))
+            enc_norm_bias = mx.array(f.get_tensor("enc_norm.bias"))
+
+        features_mx = mx.array(features[None])  # Add batch dim
+        features_normed = mx.fast.layer_norm(
+            features_mx, enc_norm_weight, enc_norm_bias, eps=1e-6
+        )
+        mx.eval(features_normed)
+        mlx_features = np.array(features_normed[0])
+
         mlx_mean_ms = np.mean(mlx_times)
         mlx_std_ms = np.std(mlx_times)
 
