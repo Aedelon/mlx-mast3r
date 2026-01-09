@@ -1,0 +1,83 @@
+[project]
+name = "mlx-mast3r"
+version = "0.1.0"
+description = "Ultra-optimized MLX implementation of MASt3R, DUNE, and DuneMASt3R for Apple Silicon"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Delanoe Pirard", email = "delanoe@aedelon.com" }]
+requires-python = ">=3.11"
+keywords = ["mlx", "mast3r", "dune", "3d-reconstruction", "apple-silicon", "vision-transformer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "mlx>=0.20.0",
+    "numpy>=1.26.0",
+    "safetensors>=0.4.0",
+    "pillow>=10.0.0",
+    "huggingface-hub>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+]
+torch = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "timm>=0.9.0",
+    "einops>=0.7.0",
+]
+all = ["mlx-mast3r[dev,torch]"]
+
+[project.scripts]
+mlx-mast3r = "mlx_mast3r.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aedelon/mlx-mast3r"
+Documentation = "https://github.com/aedelon/mlx-mast3r#readme"
+Repository = "https://github.com/aedelon/mlx-mast3r"
+Issues = "https://github.com/aedelon/mlx-mast3r/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_mast3r"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mlx_mast3r"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
