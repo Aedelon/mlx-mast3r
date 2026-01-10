@@ -7,7 +7,7 @@ Optimizations:
 - mx.fast.layer_norm (fused LayerNorm)
 - mx.compile() for graph compilation
 - FP16/BF16 precision support
-- gelu_approx for faster activation
+- gelu_fast_approx for faster activation
 - Custom RoPE 2D implementation
 """
 
@@ -381,9 +381,8 @@ class Mast3rEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, positions)
 
-        # NOTE: enc_norm is NOT applied here - it's applied in the decoder
-        # (like in PyTorch MASt3R where enc_norm is in the decoder, not encoder)
-        # The decoder applies enc_norm before decoder_embed
+        # Apply enc_norm (matches PyTorch _encode_image output)
+        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=1e-6)
 
         return x
 

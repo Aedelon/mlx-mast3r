@@ -346,19 +346,16 @@ class DuneMast3rDecoder(nn.Module):
         if self._rope_cos is None:
             self._init_rope(H1, W1)
 
-        # Normalize encoder outputs (keep original for hooks)
-        enc_feat1 = mx.fast.layer_norm(feat1, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
-        enc_feat2 = mx.fast.layer_norm(feat2, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
-
+        # Encoder outputs are already normalized (norm applied in encoder)
         # Project to decoder dim
-        x1 = self.decoder_embed(enc_feat1)
-        x2 = self.decoder_embed(enc_feat2)
+        x1 = self.decoder_embed(feat1)
+        x2 = self.decoder_embed(feat2)
 
         # Hooks: [0, 6, 9, 12] - collect features at these indices
-        # Hook 0 = encoder output AFTER enc_norm
+        # Hook 0 = encoder output (already normalized)
         hooks = [0, 6, 9, 12]
-        features1 = [enc_feat1]  # Hook 0: encoder features AFTER enc_norm
-        features2 = [enc_feat2]
+        features1 = [feat1]  # Hook 0: encoder features
+        features2 = [feat2]
 
         # Decoder blocks with cross-attention, collecting hooked outputs
         # IMPORTANT: PyTorch uses OLD x1/x2 for BOTH blocks in each iteration

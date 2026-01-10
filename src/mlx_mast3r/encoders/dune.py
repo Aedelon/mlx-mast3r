@@ -7,7 +7,7 @@ Optimizations:
 - mx.fast.layer_norm (fused LayerNorm)
 - mx.compile() for graph compilation
 - FP16/BF16 precision support
-- gelu_approx for faster activation
+- gelu_fast_approx for faster activation
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ class DuneMLP(nn.Module):
         self.fc2 = nn.Linear(config.mlp_dim, config.embed_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu_approx(self.fc1(x)))
+        return self.fc2(nn.gelu_fast_approx(self.fc1(x)))
 
 
 class DuneBlock(nn.Module):

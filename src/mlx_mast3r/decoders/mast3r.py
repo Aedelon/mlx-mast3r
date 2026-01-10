@@ -263,7 +263,7 @@ class DecoderMLP(nn.Module):
         self.fc2 = nn.Linear(config.mlp_dim, config.decoder_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu_approx(self.fc1(x)))
+        return self.fc2(nn.gelu_fast_approx(self.fc1(x)))
 
 
 class DecoderBlock(nn.Module):
@@ -321,81 +321,90 @@ class DecoderBlock(nn.Module):
         return x
 
 
+# Global cache for bilinear upsample indices/weights
+_bilinear_cache: dict[tuple[int, int, str], tuple] = {}
+
+
+def _get_bilinear_params(
+    H: int, W: int, dtype: mx.Dtype
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Get or compute cached bilinear upsample parameters.
+
+    Returns: (idx00, idx01, idx10, idx11, w00, w01, w10, w11)
+    """
+    cache_key = (H, W, str(dtype))
+    if cache_key in _bilinear_cache:
+        return _bilinear_cache[cache_key]
+
+    out_H, out_W = H * 2, W * 2
+
+    # Compute source coordinates
+    oh = np.arange(out_H, dtype=np.float32)
+    ow = np.arange(out_W, dtype=np.float32)
+
+    src_h = oh * (H - 1) / (out_H - 1) if out_H > 1 else np.zeros_like(oh)
+    src_w = ow * (W - 1) / (out_W - 1) if out_W > 1 else np.zeros_like(ow)
+
+    # Floor indices
+    h0 = np.floor(src_h).astype(np.int32)
+    w0 = np.floor(src_w).astype(np.int32)
+    h1 = np.minimum(h0 + 1, H - 1)
+    w1 = np.minimum(w0 + 1, W - 1)
+
+    # Fractional parts
+    fh = src_h - h0
+    fw = src_w - w0
+
+    # 2D weight grids
+    fh_2d = fh[:, None]
+    fw_2d = fw[None, :]
+
+    w00 = mx.array((1 - fh_2d) * (1 - fw_2d), dtype=dtype)[:, :, None]
+    w01 = mx.array((1 - fh_2d) * fw_2d, dtype=dtype)[:, :, None]
+    w10 = mx.array(fh_2d * (1 - fw_2d), dtype=dtype)[:, :, None]
+    w11 = mx.array(fh_2d * fw_2d, dtype=dtype)[:, :, None]
+
+    # Index meshgrids
+    h0_2d, w0_2d = np.meshgrid(h0, w0, indexing="ij")
+    h1_2d, w1_2d = np.meshgrid(h1, w1, indexing="ij")
+
+    # Linear indices (flattened for gather)
+    idx00 = mx.array((h0_2d * W + w0_2d).flatten(), dtype=mx.int32)
+    idx01 = mx.array((h0_2d * W + w1_2d).flatten(), dtype=mx.int32)
+    idx10 = mx.array((h1_2d * W + w0_2d).flatten(), dtype=mx.int32)
+    idx11 = mx.array((h1_2d * W + w1_2d).flatten(), dtype=mx.int32)
+
+    result = (idx00, idx01, idx10, idx11, w00, w01, w10, w11)
+    _bilinear_cache[cache_key] = result
+    return result
+
+
 def bilinear_upsample_2x(x: mx.array, align_corners: bool = True) -> mx.array:
     """Bilinear upsampling by factor 2 with align_corners support.
 
     Input: [B, H, W, C], Output: [B, 2H, 2W, C]
 
-    For align_corners=True (PyTorch DPT default):
-    - Source coords: src = dst * (in_size - 1) / (out_size - 1)
-    - This ensures corners of input map to corners of output
-
-    Vectorized implementation using gather operations.
+    Uses cached indices/weights for repeated calls with same dimensions.
     """
     B, H, W, C = x.shape
     out_H, out_W = H * 2, W * 2
 
-    if align_corners:
-        # For scale_factor=2 with align_corners=True:
-        # Output pixel i maps to source coordinate: i * (H-1) / (2H-1)
-
-        # Create source coordinate arrays
-        # For height: src_h[i] = i * (H-1) / (out_H-1)
-        oh = np.arange(out_H, dtype=np.float32)
-        ow = np.arange(out_W, dtype=np.float32)
-
-        src_h = oh * (H - 1) / (out_H - 1) if out_H > 1 else np.zeros_like(oh)
-        src_w = ow * (W - 1) / (out_W - 1) if out_W > 1 else np.zeros_like(ow)
-
-        # Floor indices and fractional parts
-        h0 = np.floor(src_h).astype(np.int32)
-        w0 = np.floor(src_w).astype(np.int32)
-        h1 = np.minimum(h0 + 1, H - 1)
-        w1 = np.minimum(w0 + 1, W - 1)
-
-        fh = src_h - h0
-        fw = src_w - w0
-
-        # Create 2D weight grids [out_H, out_W]
-        fh_2d = fh[:, None]  # [out_H, 1]
-        fw_2d = fw[None, :]  # [1, out_W]
-
-        w00 = mx.array((1 - fh_2d) * (1 - fw_2d), dtype=x.dtype)[:, :, None]  # [out_H, out_W, 1]
-        w01 = mx.array((1 - fh_2d) * fw_2d, dtype=x.dtype)[:, :, None]
-        w10 = mx.array(fh_2d * (1 - fw_2d), dtype=x.dtype)[:, :, None]
-        w11 = mx.array(fh_2d * fw_2d, dtype=x.dtype)[:, :, None]
-
-        # Gather the 4 corner pixels for each output position
-        # Use take along axis with precomputed indices
-        # x: [B, H, W, C] -> need to gather at (h0[i], w0[j]) for all i, j
-
-        # Create index meshgrids
-        h0_2d, w0_2d = np.meshgrid(h0, w0, indexing='ij')  # [out_H, out_W]
-        h1_2d, w1_2d = np.meshgrid(h1, w1, indexing='ij')
-
-        # Flatten spatial dims for gather: [B, H*W, C]
-        x_flat = x.reshape(B, H * W, C)
-
-        # Compute linear indices for the 4 corners
-        idx00 = mx.array(h0_2d * W + w0_2d)  # [out_H, out_W]
-        idx01 = mx.array(h0_2d * W + w1_2d)
-        idx10 = mx.array(h1_2d * W + w0_2d)
-        idx11 = mx.array(h1_2d * W + w1_2d)
-
-        # Gather pixels: [B, out_H, out_W, C]
-        p00 = x_flat[:, idx00.flatten(), :].reshape(B, out_H, out_W, C)
-        p01 = x_flat[:, idx01.flatten(), :].reshape(B, out_H, out_W, C)
-        p10 = x_flat[:, idx10.flatten(), :].reshape(B, out_H, out_W, C)
-        p11 = x_flat[:, idx11.flatten(), :].reshape(B, out_H, out_W, C)
-
-        # Bilinear interpolation
-        result = p00 * w00 + p01 * w01 + p10 * w10 + p11 * w11
-
-        return result
-
-    else:
-        # Without align_corners, use nearest neighbor
+    if not align_corners:
         return nearest_upsample_2x(x)
+
+    # Get cached parameters
+    idx00, idx01, idx10, idx11, w00, w01, w10, w11 = _get_bilinear_params(H, W, x.dtype)
+
+    # Flatten spatial dims for gather
+    x_flat = x.reshape(B, H * W, C)
+
+    # Gather and reshape
+    p00 = x_flat[:, idx00, :].reshape(B, out_H, out_W, C)
+    p01 = x_flat[:, idx01, :].reshape(B, out_H, out_W, C)
+    p10 = x_flat[:, idx10, :].reshape(B, out_H, out_W, C)
+    p11 = x_flat[:, idx11, :].reshape(B, out_H, out_W, C)
+
+    return p00 * w00 + p01 * w01 + p10 * w10 + p11 * w11
 
 
 def nearest_upsample_2x(x: mx.array) -> mx.array:
@@ -711,20 +720,16 @@ class Mast3rDecoder(nn.Module):
         if self._rope_cos is None:
             self._init_rope(H1, W1)
 
-        # Normalize encoder outputs (keep original for hooks)
-        enc_feat1 = mx.fast.layer_norm(feat1, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
-        enc_feat2 = mx.fast.layer_norm(feat2, self.enc_norm_weight, self.enc_norm_bias, eps=1e-6)
-
+        # Encoder outputs are already normalized (enc_norm applied in encoder)
         # Project to decoder dim
-        x1 = self.decoder_embed(enc_feat1)
-        x2 = self.decoder_embed(enc_feat2)
+        x1 = self.decoder_embed(feat1)
+        x2 = self.decoder_embed(feat2)
 
         # Hooks: [0, 6, 9, 12] - collect features at these indices
-        # Hook 0 = encoder output AFTER enc_norm (1024 dim), hooks 6,9,12 = decoder layers
-        # NOTE: PyTorch DPT receives enc_norm(encoder_output) for hook 0
+        # Hook 0 = encoder output (already normalized, 1024 dim)
         hooks = [0, 6, 9, 12]
-        features1 = [enc_feat1]  # Hook 0: encoder features AFTER enc_norm (1024 dim)
-        features2 = [enc_feat2]
+        features1 = [feat1]  # Hook 0: encoder features (1024 dim)
+        features2 = [feat2]
 
         # Decoder blocks with cross-attention, collecting hooked outputs
         # IMPORTANT: PyTorch uses OLD x1/x2 for BOTH blocks in each iteration
