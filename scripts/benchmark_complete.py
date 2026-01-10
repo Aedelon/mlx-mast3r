@@ -16,10 +16,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Add paths
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-sys.path.insert(0, str(Path.home() / "Workspace/dune"))
-sys.path.insert(0, str(Path.home() / "Workspace/mast3r"))
+# Add paths - use thirdparty repos
+REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "thirdparty/dune"))
+sys.path.insert(0, str(REPO_ROOT / "thirdparty/mast3r"))
+sys.path.insert(0, str(REPO_ROOT / "thirdparty/mast3r/dust3r"))
 
 import mlx.core as mx
 
@@ -32,6 +34,7 @@ BENCHMARK_ITERATIONS = 20
 
 PTH_DIR = Path.home() / ".cache/mast3r_runtime/checkpoints"
 SAFETENSORS_DIR = Path.home() / ".cache/mlx-mast3r"
+DUNE_SAFETENSORS_DIR = Path.home() / ".cache/mast3r_runtime/safetensors"
 
 # Image sizes for benchmarks - all square for DUNE, 4:3 for MASt3R
 DUNE_IMG_SIZE_336 = (336, 336, 3)
@@ -120,7 +123,7 @@ def load_mlx_dune(variant: str, resolution: int):
         compile=True,
     )
 
-    safetensors_path = SAFETENSORS_DIR / f"dune_vit_{variant}_{resolution}" / "encoder.safetensors"
+    safetensors_path = DUNE_SAFETENSORS_DIR / f"dune_vit_{variant}_{resolution}" / "encoder.safetensors"
     engine.load(safetensors_path)
 
     return engine
@@ -512,6 +515,206 @@ def benchmark_mast3r_full() -> dict:
     }
 
 
+def load_mlx_dunemast3r_full(variant: str, resolution: int):
+    """Load full DuneMASt3R pipeline (encoder + decoder) MLX."""
+    from mlx_mast3r.decoders.dunemast3r import DuneMast3rDecoderEngine
+
+    engine = DuneMast3rDecoderEngine(
+        encoder_variant=variant,
+        resolution=resolution,
+        precision="fp16",
+        compile=True,
+    )
+
+    encoder_path = DUNE_SAFETENSORS_DIR / f"dune_vit_{variant}_{resolution}" / "encoder.safetensors"
+    decoder_path = DUNE_SAFETENSORS_DIR / f"dune_vit_{variant}_{resolution}" / "decoder.safetensors"
+    engine.load(encoder_path, decoder_path)
+
+    return engine
+
+
+def load_pytorch_dunemast3r_local(variant: str, resolution: int):
+    """Load DuneMASt3R from local checkpoints using thirdparty/dune."""
+    inf = float("inf")  # Required for eval(mast3r_model_str)
+    from model.dune import load_dune_encoder_from_checkpoint
+    from mast3r.model import AsymmetricMASt3R, AsymmetricMASt3RWithDUNEBackbone
+
+    # Load encoder from local .pth using DUNE's own loader
+    encoder_path = PTH_DIR / f"dune_vit{variant}14_{resolution}.pth"
+    encoder, _ = load_dune_encoder_from_checkpoint(str(encoder_path))
+    patch_size = encoder.patch_size
+
+    # Load decoder checkpoint
+    decoder_ckpt_path = PTH_DIR / f"dunemast3r_cvpr25_vit{variant}.pth"
+    decoder_ckpt = torch.load(str(decoder_ckpt_path), map_location="cpu", weights_only=False)
+
+    # Build MASt3R model string
+    mast3r_model_str = decoder_ckpt["mast3r_model_str"]
+
+    # Add landscape_only=False
+    if "landscape_only" not in mast3r_model_str:
+        mast3r_model_str = mast3r_model_str[:-1] + ", landscape_only=False)"
+
+    # Add patch_size
+    if "patch_size" not in mast3r_model_str:
+        mast3r_model_str = mast3r_model_str[:-1] + f", patch_size={patch_size})"
+
+    # Create MASt3R decoder
+    mast3r = eval(mast3r_model_str)
+
+    # Modify DPT heads for patch_size=14
+    if patch_size != 16:
+        for head in [mast3r.downstream_head1, mast3r.downstream_head2]:
+            head.dpt.patch_size = (patch_size, patch_size)
+            head.dpt.P_H = max(1, patch_size // head.dpt.stride_level)
+            head.dpt.P_W = max(1, patch_size // head.dpt.stride_level)
+            head.dpt.head[1].scale_factor *= 14 / 16
+
+    # Create combined model
+    model = AsymmetricMASt3RWithDUNEBackbone.__new__(AsymmetricMASt3RWithDUNEBackbone)
+    torch.nn.Module.__init__(model)
+
+    model.dune_backbone = encoder
+    model.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).float().view(1, 3, 1, 1))
+    model.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).float().view(1, 3, 1, 1))
+    model.norm = torch.nn.LayerNorm(encoder.num_features)
+    model.landscape_only = False
+    model.patch_size = patch_size
+    model.square_ok = True
+    model.mast3r = mast3r
+
+    # Load decoder weights
+    model.load_state_dict(decoder_ckpt["model"], strict=False)
+
+    # Freeze encoder
+    model.dune_backbone.eval()
+    for p in model.dune_backbone.parameters():
+        p.requires_grad = False
+
+    return model.to("mps").eval()
+
+
+def benchmark_dunemast3r_full(variant: str, resolution: int) -> dict:
+    """Benchmark full DuneMASt3R pipeline: MLX vs PyTorch MPS.
+
+    Uses local checkpoints for both encoder and decoder so that weights
+    match between PyTorch and MLX (safetensors converted from same checkpoints).
+    """
+    print(f"\n{'=' * 60}")
+    print(f"DuneMASt3R {variant.upper()} @ {resolution} (Full Pipeline)")
+    print("=" * 60)
+
+    img_size = (resolution, resolution, 3)
+    img1 = create_test_image(img_size, seed=42)
+    img2 = create_test_image(img_size, seed=43)
+
+    pt_pts3d = None
+    pt_mean_ms = None
+    mlx_pts3d = None
+    mlx_mean_ms = None
+
+    # --- PyTorch MPS ---
+    print("\nPyTorch MPS (local checkpoints)...")
+    try:
+        pt_model = load_pytorch_dunemast3r_local(variant, resolution)
+
+        # Prepare images - MASt3R expects [-1, 1] normalized NCHW
+        img1_pt = torch.from_numpy(img1).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        img1_pt = (img1_pt - 0.5) / 0.5
+        img1_pt = img1_pt.to("mps")
+        img2_pt = torch.from_numpy(img2).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        img2_pt = (img2_pt - 0.5) / 0.5
+        img2_pt = img2_pt.to("mps")
+
+        H, W = resolution, resolution
+        view1 = {
+            "img": img1_pt,
+            "true_shape": torch.tensor([[H, W]]),
+            "idx": 0,
+            "instance": "0",
+        }
+        view2 = {
+            "img": img2_pt,
+            "true_shape": torch.tensor([[H, W]]),
+            "idx": 1,
+            "instance": "1",
+        }
+
+        # Warmup
+        with torch.no_grad():
+            for _ in range(WARMUP_ITERATIONS):
+                _ = pt_model(view1, view2)
+                torch.mps.synchronize()
+
+        # Benchmark
+        pt_times = []
+        with torch.no_grad():
+            for _ in range(BENCHMARK_ITERATIONS):
+                t0 = time.perf_counter()
+                out = pt_model(view1, view2)
+                torch.mps.synchronize()
+                pt_times.append((time.perf_counter() - t0) * 1000)
+
+        pt_pts3d = out[0]["pts3d"].cpu().numpy()[0]
+        pt_mean_ms = np.mean(pt_times)
+        pt_std_ms = np.std(pt_times)
+
+        print(f"  {pt_mean_ms:.2f} ± {pt_std_ms:.2f} ms ({1000 / pt_mean_ms:.1f} FPS)")
+
+    except Exception as e:
+        print(f"  FAILED - {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    # --- MLX ---
+    print("\nMLX FP16...")
+    try:
+        mlx_engine = load_mlx_dunemast3r_full(variant, resolution)
+
+        # Warmup
+        mlx_engine.warmup(WARMUP_ITERATIONS)
+
+        # Benchmark
+        mlx_times = []
+        for _ in range(BENCHMARK_ITERATIONS):
+            out1, out2, ms = mlx_engine.infer(img1, img2)
+            mlx_times.append(ms)
+
+        mlx_pts3d = out1["pts3d"]
+        mlx_mean_ms = np.mean(mlx_times)
+        mlx_std_ms = np.std(mlx_times)
+
+        print(f"  {mlx_mean_ms:.2f} ± {mlx_std_ms:.2f} ms ({1000 / mlx_mean_ms:.1f} FPS)")
+
+    except Exception as e:
+        print(f"  FAILED - {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    # --- Correlation & Speedup ---
+    correlation = None
+    speedup = None
+    if pt_pts3d is not None and mlx_pts3d is not None:
+        # Flatten and compute correlation
+        pt_flat = pt_pts3d.flatten()
+        mlx_flat = mlx_pts3d.flatten()
+        min_len = min(len(pt_flat), len(mlx_flat))
+        correlation = np.corrcoef(pt_flat[:min_len], mlx_flat[:min_len])[0, 1]
+        speedup = pt_mean_ms / mlx_mean_ms if mlx_mean_ms else 0
+        print(f"\n  Correlation: {correlation:.6f}")
+        print(f"  Speedup:     {speedup:.2f}x MLX faster")
+
+    return {
+        "model": f"DuneMASt3R {variant} @ {resolution}",
+        "pt_ms": pt_mean_ms,
+        "mlx_ms": mlx_mean_ms,
+        "correlation": correlation,
+        "speedup": speedup,
+    }
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -586,6 +789,28 @@ def main():
                 "speedup": None,
             }
         )
+
+    # 4. DuneMASt3R Full Pipeline (Encoder + Decoder)
+    print("\n" + "=" * 70)
+    print("PART 4: DuneMASt3R FULL PIPELINE (ENCODER + DECODER)")
+    print("=" * 70)
+
+    for variant in ["small", "base"]:
+        for resolution in [336, 448]:
+            try:
+                result = benchmark_dunemast3r_full(variant, resolution)
+                results.append(result)
+            except Exception as e:
+                print(f"FAILED: DuneMASt3R {variant} @ {resolution}: {e}")
+                results.append(
+                    {
+                        "model": f"DuneMASt3R {variant} @ {resolution}",
+                        "pt_ms": None,
+                        "mlx_ms": None,
+                        "correlation": None,
+                        "speedup": None,
+                    }
+                )
 
     # Summary Table
     print("\n")

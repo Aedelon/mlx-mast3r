@@ -40,3 +40,12 @@ Thumbs.db
 *.ckpt
 *.pth
 *.bin
+
+# Third-party repos (cloned for benchmark)
+thirdparty/
+
+# Temporary debug scripts
+scripts/benchmark_dunemast3r.py
+scripts/benchmark_dunemast3r_correlation.py
+scripts/compare_dune_weights.py
+scripts/convert_dune_from_hub.py
