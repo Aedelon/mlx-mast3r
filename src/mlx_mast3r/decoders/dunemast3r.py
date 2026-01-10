@@ -149,15 +149,18 @@ class DuneDPTHead(nn.Module):
         self.head_conv2 = nn.Conv2d(last_dim, last_dim, kernel_size=3, padding=1)
         self.head_conv3 = nn.Conv2d(last_dim, num_channels, kernel_size=1)
 
-    def __call__(self, features: list[mx.array], H: int, W: int) -> mx.array:
+    def __call__(
+        self, features: list[mx.array], H: int, W: int, target_h: int = 0, target_w: int = 0
+    ) -> mx.array:
         """Process multi-scale features through DPT.
 
         Args:
             features: List of [B, N, C] features at hooked layers
             H, W: Patch grid dimensions
+            target_h, target_w: Target output size (for resize). If 0, use H*16, W*16.
 
         Returns:
-            [B, H*14, W*14, num_channels] - full resolution for patch_size=14
+            [B, target_h, target_w, num_channels] - full resolution output
         """
         B = features[0].shape[0]
 
@@ -196,6 +199,17 @@ class DuneDPTHead(nn.Module):
         out = self.head_conv2(out)
         out = nn.relu(out)
         out = self.head_conv3(out)
+
+        # Resize to target size if specified (for DUNE patch_size=14)
+        # DPT produces H*16 x W*16, but DUNE images are H*14 x W*14
+        if target_h > 0 and target_w > 0:
+            current_h, current_w = out.shape[1], out.shape[2]
+            if current_h != target_h or current_w != target_w:
+                # Use bilinear interpolation via nn.Upsample
+                scale_h = target_h / current_h
+                scale_w = target_w / current_w
+                upsample = nn.Upsample(scale_factor=(scale_h, scale_w), mode="linear", align_corners=True)
+                out = upsample(out)
 
         return out
 
@@ -369,8 +383,12 @@ class DuneMast3rDecoder(nn.Module):
             features2[-1] = x2_norm
 
         # DPT heads for pts3d + conf
-        dpt_out1 = self.head1(features1, H1, W1)
-        dpt_out2 = self.head2(features2, H2, W2)
+        # Pass target size = H*patch_size x W*patch_size (image resolution)
+        ps = self.config.patch_size  # 14
+        target_h1, target_w1 = H1 * ps, W1 * ps
+        target_h2, target_w2 = H2 * ps, W2 * ps
+        dpt_out1 = self.head1(features1, H1, W1, target_h1, target_w1)
+        dpt_out2 = self.head2(features2, H2, W2, target_h2, target_w2)
 
         # Local features via MLP (for descriptors)
         cat1 = mx.concatenate([feat1, x1_norm], axis=-1)
