@@ -97,6 +97,112 @@ model = Mast3rFull.from_pretrained(resolution=512)
 out1, out2 = model.reconstruct(img1, img2)
 ```
 
+## API Reference
+
+### Models Overview
+
+| Class | Use Case | Speed | Quality |
+|-------|----------|-------|---------|
+| `DUNE` | Feature extraction | 11-32ms | Good |
+| `Mast3r` | Feature extraction | 183ms | Best |
+| `DuneMast3r` | 3D reconstruction | 184-207ms | Good |
+| `Mast3rFull` | 3D reconstruction | 805ms | Best |
+
+### DUNE
+
+Fast feature encoder based on DINOv2.
+
+```python
+from mlx_mast3r import DUNE
+
+# Load model
+model = DUNE.from_pretrained(
+    variant="base",      # "small" (384d) or "base" (768d)
+    resolution=336,      # 336 or 448
+    precision="fp16",    # "fp32", "fp16", "bf16"
+)
+
+# Encode image
+features = model.encode(image)           # [N, D] numpy array
+features = model.encode_batch([img1, img2])  # List of arrays
+
+# Properties
+model.embed_dim    # 384 (small) or 768 (base)
+model.num_patches  # 576 (336) or 1024 (448)
+```
+
+### Mast3r
+
+MASt3R ViT-Large encoder for highest quality features.
+
+```python
+from mlx_mast3r import Mast3r
+
+model = Mast3r.from_pretrained(
+    resolution=512,      # Image height (width = 4:3 ratio)
+    precision="fp16",
+)
+
+features = model.encode(image)  # [N, 1024] numpy array
+```
+
+### DuneMast3r
+
+DUNE encoder + MASt3R decoder for fast 3D reconstruction.
+
+```python
+from mlx_mast3r import DuneMast3r
+
+model = DuneMast3r.from_pretrained(
+    encoder_variant="base",  # "small" or "base"
+    resolution=336,
+    precision="fp16",
+)
+
+# Stereo 3D reconstruction
+out1, out2 = model.reconstruct(img1, img2)
+
+# Output format
+out1["pts3d"]  # [H, W, 3] - 3D points in camera space
+out1["conf"]   # [H, W] - confidence map (0-1)
+out1["desc"]   # [H, W, 24] - dense descriptors
+
+# Single image encoding (for retrieval)
+features = model.encode(image)  # [N, D]
+```
+
+### Mast3rFull
+
+Full MASt3R pipeline for highest quality 3D reconstruction.
+
+```python
+from mlx_mast3r import Mast3rFull
+
+model = Mast3rFull.from_pretrained(
+    resolution=512,
+    precision="fp16",
+)
+
+# Stereo 3D reconstruction
+out1, out2 = model.reconstruct(img1, img2)
+
+# Same output format as DuneMast3r
+pts3d = out1["pts3d"]  # [H, W, 3]
+```
+
+### Input Format
+
+All models expect:
+- **Images**: `np.ndarray` of shape `[H, W, 3]`, dtype `uint8`, RGB order
+- **Resolution**: Images are automatically resized to model resolution
+
+### Output Format
+
+Reconstruction outputs (`reconstruct()`):
+- `pts3d`: 3D points in camera 1 coordinate system
+- `conf`: Per-pixel confidence (higher = more reliable)
+- `desc`: Dense descriptors for matching between views
+
 ## Architecture
 
 ```
