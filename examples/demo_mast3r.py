@@ -26,7 +26,9 @@ def main():
         return
 
     img1_path, img2_path = images[0], images[1]
-    resolution = 512
+
+    # MASt3R uses 4:3 aspect ratio: 512x672 for resolution=512
+    resolution = (512, 672)
 
     # Load and resize images
     print(f"Image 1: {img1_path.name}")

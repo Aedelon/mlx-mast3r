@@ -11,12 +11,18 @@ import numpy as np
 from PIL import Image
 
 
-def load_image(path: str | Path, resolution: int | None = None) -> np.ndarray:
+def load_image(
+    path: str | Path,
+    resolution: int | tuple[int, int] | None = None,
+) -> np.ndarray:
     """Load image from path and optionally resize.
 
     Args:
         path: Path to image file
-        resolution: Target resolution (square). If None, keep original size.
+        resolution: Target resolution. Can be:
+            - int: square resolution (H=W=resolution)
+            - tuple (H, W): specific height and width
+            - None: keep original size
 
     Returns:
         [H, W, 3] uint8 numpy array
@@ -24,7 +30,12 @@ def load_image(path: str | Path, resolution: int | None = None) -> np.ndarray:
     img = Image.open(path).convert("RGB")
 
     if resolution is not None:
-        img = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
+        if isinstance(resolution, int):
+            size = (resolution, resolution)
+        else:
+            # PIL resize takes (W, H), but we use (H, W) convention
+            size = (resolution[1], resolution[0])
+        img = img.resize(size, Image.Resampling.LANCZOS)
 
     return np.array(img)
 
