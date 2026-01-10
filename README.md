@@ -40,6 +40,20 @@ cd mlx-mast3r
 uv sync
 ```
 
+### With Benchmarks (PyTorch comparison)
+
+```bash
+# Clone with submodules for PyTorch reference implementations
+git clone --recurse-submodules https://github.com/aedelon/mlx-mast3r.git
+cd mlx-mast3r
+
+# Install with benchmark dependencies (torch, timm, etc.)
+uv sync --extra benchmark
+
+# Run benchmarks
+uv run python scripts/benchmark_complete.py
+```
+
 ## Quick Start
 
 ### DuneMASt3R (Recommended for Real-time)

@@ -1,0 +1,7 @@
+[submodule "thirdparty/mast3r"]
+	path = thirdparty/mast3r
+	url = https://github.com/naver/mast3r.git
+
+[submodule "thirdparty/dune"]
+	path = thirdparty/dune
+	url = https://github.com/naver/dune.git

@@ -42,7 +42,15 @@ torch = [
     "timm>=0.9.0",
     "einops>=0.7.0",
 ]
-all = ["mlx-mast3r[dev,torch]"]
+benchmark = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "timm>=0.9.0",
+    "einops>=0.7.0",
+    "roma>=1.3.0",
+    "scipy>=1.11.0",
+]
+all = ["mlx-mast3r[dev,benchmark]"]
 
 [project.scripts]
 mlx-mast3r = "mlx_mast3r.cli:main"
