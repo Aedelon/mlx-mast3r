@@ -11,11 +11,11 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from mlx_mast3r.encoders import DuneEncoder, DuneConfig, Mast3rEncoder, Mast3rEncoderConfig
-from mlx_mast3r.encoders.dune import DuneEncoderEngine
-from mlx_mast3r.encoders.mast3r import Mast3rEncoderEngine
 from mlx_mast3r.decoders.dunemast3r import DuneMast3rEngine
 from mlx_mast3r.decoders.mast3r import Mast3rDecoderEngine
+from mlx_mast3r.encoders.dune import DuneEncoderEngine
+from mlx_mast3r.encoders.mast3r import Mast3rEncoderEngine
+from mlx_mast3r.utils.download import download_dune, download_dunemast3r, download_mast3r
 
 
 class DUNE:
@@ -52,20 +52,19 @@ class DUNE:
         resolution: int = 336,
         precision: str = "fp16",
         cache_dir: str | Path | None = None,
-    ) -> "DUNE":
-        """Load pretrained DUNE model."""
+    ) -> DUNE:
+        """Load pretrained DUNE model.
+
+        Weights are automatically downloaded from HuggingFace if not present.
+        """
         model = cls(variant=variant, resolution=resolution, precision=precision)
 
-        if cache_dir is None:
-            cache_dir = Path.home() / ".cache/mlx-mast3r"
-        cache_dir = Path(cache_dir)
-
-        weights_path = cache_dir / f"dune_vit_{variant}_{resolution}" / "encoder.safetensors"
-        if not weights_path.exists():
-            raise FileNotFoundError(
-                f"Weights not found at {weights_path}. "
-                f"Download from: https://download.europe.naverlabs.com/dune/"
-            )
+        # Download weights if not present
+        weights_path = download_dune(
+            variant=variant,
+            resolution=resolution,
+            cache_dir=cache_dir,
+        )
 
         model.engine.load(weights_path)
         return model
@@ -125,20 +124,15 @@ class Mast3r:
         resolution: int = 512,
         precision: str = "fp16",
         cache_dir: str | Path | None = None,
-    ) -> "Mast3r":
-        """Load pretrained MASt3R model."""
+    ) -> Mast3r:
+        """Load pretrained MASt3R model.
+
+        Weights are automatically downloaded from HuggingFace if not present.
+        """
         model = cls(resolution=resolution, precision=precision)
 
-        if cache_dir is None:
-            cache_dir = Path.home() / ".cache/mlx-mast3r"
-        cache_dir = Path(cache_dir)
-
-        weights_path = cache_dir / "mast3r_vit_large" / "unified.safetensors"
-        if not weights_path.exists():
-            raise FileNotFoundError(
-                f"Weights not found at {weights_path}. "
-                f"Download from HuggingFace: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-            )
+        # Download weights if not present
+        weights_path = download_mast3r(cache_dir=cache_dir)
 
         model.engine.load(weights_path)
         return model
@@ -192,27 +186,23 @@ class DuneMast3r:
         resolution: int = 336,
         precision: str = "fp16",
         cache_dir: str | Path | None = None,
-    ) -> "DuneMast3r":
-        """Load pretrained DuneMASt3R model."""
+    ) -> DuneMast3r:
+        """Load pretrained DuneMASt3R model.
+
+        Weights are automatically downloaded from HuggingFace if not present.
+        """
         model = cls(
             encoder_variant=encoder_variant,
             resolution=resolution,
             precision=precision,
         )
 
-        if cache_dir is None:
-            cache_dir = Path.home() / ".cache/mlx-mast3r"
-        cache_dir = Path(cache_dir)
-
-        encoder_path = (
-            cache_dir / f"dune_vit_{encoder_variant}_{resolution}" / "encoder.safetensors"
+        # Download weights if not present
+        encoder_path, decoder_path = download_dunemast3r(
+            variant=encoder_variant,
+            resolution=resolution,
+            cache_dir=cache_dir,
         )
-        decoder_path = cache_dir / f"dunemast3r_cvpr25_vit{encoder_variant}.pth"
-
-        if not encoder_path.exists():
-            raise FileNotFoundError(f"Encoder weights not found at {encoder_path}")
-        if not decoder_path.exists():
-            raise FileNotFoundError(f"Decoder weights not found at {decoder_path}")
 
         model.engine.load(encoder_path, decoder_path)
         return model
@@ -279,20 +269,15 @@ class Mast3rFull:
         resolution: int = 512,
         precision: str = "fp16",
         cache_dir: str | Path | None = None,
-    ) -> "Mast3rFull":
-        """Load pretrained full MASt3R model."""
+    ) -> Mast3rFull:
+        """Load pretrained full MASt3R model.
+
+        Weights are automatically downloaded from HuggingFace if not present.
+        """
         model = cls(resolution=resolution, precision=precision)
 
-        if cache_dir is None:
-            cache_dir = Path.home() / ".cache/mlx-mast3r"
-        cache_dir = Path(cache_dir)
-
-        weights_path = cache_dir / "mast3r_vit_large" / "unified.safetensors"
-        if not weights_path.exists():
-            raise FileNotFoundError(
-                f"Weights not found at {weights_path}. "
-                f"Download from HuggingFace: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-            )
+        # Download weights if not present
+        weights_path = download_mast3r(cache_dir=cache_dir)
 
         model.engine.load(weights_path)
         return model

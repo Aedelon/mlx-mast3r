@@ -251,20 +251,60 @@ mlx-mast3r/
 
 ## Model Weights
 
-Weights are automatically downloaded from HuggingFace Hub:
+Weights are **automatically downloaded** from HuggingFace Hub when calling `from_pretrained()`.
 
-| Model | Hub Path | Size |
-|-------|----------|------|
-| DUNE Small | `aedelon/dune-vit-small` | 85MB |
-| DUNE Base | `aedelon/dune-vit-base` | 330MB |
-| MASt3R ViT-L | `aedelon/mast3r-vit-large` | 1.2GB |
+### HuggingFace Repositories (Recommended)
 
-### Manual Download
+Pre-converted safetensors, ready to use:
 
-```bash
-# Download to cache directory
-python -m mlx_mast3r.download --model dune-base --resolution 336
+| Model | Repository | Files |
+|-------|------------|-------|
+| MASt3R ViT-L | [Aedelon/mast3r-vit-large-fp16](https://huggingface.co/Aedelon/mast3r-vit-large-fp16) | `unified.safetensors` |
+| DUNE/DuneMASt3R | [Aedelon/dunemast3r-models-fp16](https://huggingface.co/Aedelon/dunemast3r-models-fp16) | `encoder.safetensors`, `decoder.safetensors` |
+
+### Manual Download (Python API)
+
+```python
+from mlx_mast3r.utils.download import (
+    download_mast3r,
+    download_dune,
+    download_dunemast3r,
+)
+
+# Download MASt3R (safetensors)
+mast3r_path = download_mast3r()
+
+# Download DUNE encoder only
+encoder_path = download_dune(variant="base", resolution=336)
+
+# Download DuneMASt3R (encoder + decoder)
+encoder_path, decoder_path = download_dunemast3r(variant="base", resolution=336)
 ```
+
+### PTH Checkpoints (For Manual Conversion)
+
+Original Naver checkpoints for custom conversion:
+
+```python
+from mlx_mast3r.utils.download import (
+    download_dune_pth,
+    download_dunemast3r_pth,
+    download_mast3r_pth,
+)
+
+# Download DUNE PTH from Naver
+dune_pth = download_dune_pth(variant="base", resolution=336)
+
+# Download DuneMASt3R decoder PTH
+decoder_pth = download_dunemast3r_pth(variant="base")
+
+# Download MASt3R from Naver HF repo
+mast3r_pth = download_mast3r_pth()
+```
+
+### Cache Location
+
+All weights are cached in `~/.cache/mlx-mast3r/`.
 
 ## Benchmarking
 
