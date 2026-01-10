@@ -29,6 +29,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_mast3r.constants import LAYER_NORM_EPS
+from mlx_mast3r.layers import MLP
+
 
 @dataclass
 class Mast3rDecoderConfig:
@@ -254,18 +257,6 @@ class DecoderCrossAttention(nn.Module):
         return self.proj(out.transpose(0, 2, 1, 3).reshape(B, N, D))
 
 
-class DecoderMLP(nn.Module):
-    """MLP with approximate GELU."""
-
-    def __init__(self, config: Mast3rDecoderConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.decoder_dim, config.mlp_dim)
-        self.fc2 = nn.Linear(config.mlp_dim, config.decoder_dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu_fast_approx(self.fc1(x)))
-
-
 class DecoderBlock(nn.Module):
     """Decoder transformer block with self and cross attention.
 
@@ -297,7 +288,7 @@ class DecoderBlock(nn.Module):
         # MLP
         self.norm3_weight = mx.ones((dim,))
         self.norm3_bias = mx.zeros((dim,))
-        self.mlp = DecoderMLP(config)
+        self.mlp = MLP(config.decoder_dim, config.mlp_dim)
 
     def set_rope_tables(self, cos: mx.array, sin: mx.array, positions: mx.array) -> None:
         """Propagate RoPE tables to self-attention and cross-attention."""
@@ -306,16 +297,16 @@ class DecoderBlock(nn.Module):
 
     def __call__(self, x: mx.array, context: mx.array) -> mx.array:
         # Self-attention
-        normed = mx.fast.layer_norm(x, self.norm1_weight, self.norm1_bias, eps=1e-6)
+        normed = mx.fast.layer_norm(x, self.norm1_weight, self.norm1_bias, eps=LAYER_NORM_EPS)
         x = x + self.self_attn(normed)
 
         # Cross-attention (norm2 on query, norm_y on context)
-        x_normed = mx.fast.layer_norm(x, self.norm2_weight, self.norm2_bias, eps=1e-6)
-        context_normed = mx.fast.layer_norm(context, self.norm_y_weight, self.norm_y_bias, eps=1e-6)
+        x_normed = mx.fast.layer_norm(x, self.norm2_weight, self.norm2_bias, eps=LAYER_NORM_EPS)
+        context_normed = mx.fast.layer_norm(context, self.norm_y_weight, self.norm_y_bias, eps=LAYER_NORM_EPS)
         x = x + self.cross_attn(x_normed, context_normed)
 
         # MLP
-        normed = mx.fast.layer_norm(x, self.norm3_weight, self.norm3_bias, eps=1e-6)
+        normed = mx.fast.layer_norm(x, self.norm3_weight, self.norm3_bias, eps=LAYER_NORM_EPS)
         x = x + self.mlp(normed)
 
         return x
@@ -747,8 +738,8 @@ class Mast3rDecoder(nn.Module):
                 features2.append(x2)
 
         # Final norm
-        x1_norm = mx.fast.layer_norm(x1, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
-        x2_norm = mx.fast.layer_norm(x2, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
+        x1_norm = mx.fast.layer_norm(x1, self.dec_norm_weight, self.dec_norm_bias, eps=LAYER_NORM_EPS)
+        x2_norm = mx.fast.layer_norm(x2, self.dec_norm_weight, self.dec_norm_bias, eps=LAYER_NORM_EPS)
 
         # If we collected 12 (final layer), update it with normed version
         if len(features1) == 4:

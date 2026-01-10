@@ -21,6 +21,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_mast3r.constants import LAYER_NORM_EPS
+from mlx_mast3r.encoders.base import EncoderBlock, PatchEmbed
+
 
 @dataclass
 class DuneConfig:
@@ -74,96 +77,17 @@ class DuneConfig:
         return self.patch_h * self.patch_w
 
 
-class DuneAttention(nn.Module):
-    """Multi-head self-attention with fused SDPA."""
-
-    def __init__(self, config: DuneConfig):
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-        dim = config.embed_dim
-        self.qkv = nn.Linear(dim, 3 * dim)
-        self.proj = nn.Linear(dim, dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        B, N, D = x.shape
-
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = (
-            qkv[:, :, 0].transpose(0, 2, 1, 3),
-            qkv[:, :, 1].transpose(0, 2, 1, 3),
-            qkv[:, :, 2].transpose(0, 2, 1, 3),
-        )
-
-        # Fused scaled dot-product attention
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
-
-        return self.proj(out.transpose(0, 2, 1, 3).reshape(B, N, D))
-
-
-class DuneMLP(nn.Module):
-    """MLP with approximate GELU for speed."""
-
-    def __init__(self, config: DuneConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.embed_dim, config.mlp_dim)
-        self.fc2 = nn.Linear(config.mlp_dim, config.embed_dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu_fast_approx(self.fc1(x)))
-
-
-class DuneBlock(nn.Module):
-    """DINOv2 encoder block with Layer Scale."""
-
-    def __init__(self, config: DuneConfig):
-        super().__init__()
-        self.embed_dim = config.embed_dim
-
-        # LayerNorm weights (for mx.fast.layer_norm)
-        self.norm1_weight = mx.ones((config.embed_dim,))
-        self.norm1_bias = mx.zeros((config.embed_dim,))
-        self.norm2_weight = mx.ones((config.embed_dim,))
-        self.norm2_bias = mx.zeros((config.embed_dim,))
-
-        # Layer Scale (DINOv2 specific)
-        self.ls1_gamma = mx.ones((config.embed_dim,))
-        self.ls2_gamma = mx.ones((config.embed_dim,))
-
-        self.attn = DuneAttention(config)
-        self.mlp = DuneMLP(config)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        # Pre-norm attention with layer scale
-        normed1 = mx.fast.layer_norm(x, self.norm1_weight, self.norm1_bias, eps=1e-6)
-        x = x + self.ls1_gamma * self.attn(normed1)
-
-        # Pre-norm MLP with layer scale
-        normed2 = mx.fast.layer_norm(x, self.norm2_weight, self.norm2_bias, eps=1e-6)
-        x = x + self.ls2_gamma * self.mlp(normed2)
-
-        return x
-
-
-class DunePatchEmbed(nn.Module):
-    """Patch embedding with 14x14 patches."""
-
-    def __init__(self, config: DuneConfig):
-        super().__init__()
-        self.config = config
-        self.proj = nn.Conv2d(
-            3,
-            config.embed_dim,
-            kernel_size=config.patch_size,
-            stride=config.patch_size,
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        B = x.shape[0]
-        x = self.proj(x)  # [B, H/14, W/14, embed_dim]
-        return x.reshape(B, -1, self.config.embed_dim)
+def _create_dune_block(config: DuneConfig) -> EncoderBlock:
+    """Create a DUNE encoder block with the correct configuration."""
+    return EncoderBlock(
+        embed_dim=config.embed_dim,
+        num_heads=config.num_heads,
+        head_dim=config.head_dim,
+        mlp_dim=config.mlp_dim,
+        rope=None,  # DUNE doesn't use RoPE
+        use_layer_scale=True,  # DINOv2 uses layer scale
+        fast_gelu=True,
+    )
 
 
 class DuneEncoder(nn.Module):
@@ -188,7 +112,7 @@ class DuneEncoder(nn.Module):
         self.config = config
 
         # Patch embedding
-        self.patch_embed = DunePatchEmbed(config)
+        self.patch_embed = PatchEmbed(config.embed_dim, config.patch_size)
 
         # Learnable tokens
         self.cls_token = mx.zeros((1, 1, config.embed_dim))
@@ -200,7 +124,7 @@ class DuneEncoder(nn.Module):
         self.pos_embed_w = 24
 
         # Encoder blocks
-        self.blocks = [DuneBlock(config) for _ in range(config.depth)]
+        self.blocks = [_create_dune_block(config) for _ in range(config.depth)]
 
         # Final norm
         self.norm_weight = mx.ones((config.embed_dim,))
@@ -275,7 +199,7 @@ class DuneEncoder(nn.Module):
             x = block(x)
 
         # Final norm
-        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=1e-6)
+        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=LAYER_NORM_EPS)
 
         # Return patch tokens only
         start_idx = 1 + self.config.num_register_tokens

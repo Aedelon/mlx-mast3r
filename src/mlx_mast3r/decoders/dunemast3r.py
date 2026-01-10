@@ -34,11 +34,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_mast3r.constants import LAYER_NORM_EPS
+
 # Import shared components from mast3r decoder
 from mlx_mast3r.decoders.mast3r import (
     DecoderBlock,
     DecoderCrossAttention,
-    DecoderMLP,
     DecoderSelfAttention,
     DPTHead,
     FeatureFusionBlock,
@@ -371,8 +372,8 @@ class DuneMast3rDecoder(nn.Module):
                 features2.append(x2)
 
         # Final norm
-        x1_norm = mx.fast.layer_norm(x1, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
-        x2_norm = mx.fast.layer_norm(x2, self.dec_norm_weight, self.dec_norm_bias, eps=1e-6)
+        x1_norm = mx.fast.layer_norm(x1, self.dec_norm_weight, self.dec_norm_bias, eps=LAYER_NORM_EPS)
+        x2_norm = mx.fast.layer_norm(x2, self.dec_norm_weight, self.dec_norm_bias, eps=LAYER_NORM_EPS)
 
         # Update final layer features with normed version
         if len(features1) == 4:

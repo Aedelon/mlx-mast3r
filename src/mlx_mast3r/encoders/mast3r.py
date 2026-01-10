@@ -22,6 +22,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_mast3r.constants import LAYER_NORM_EPS
+from mlx_mast3r.encoders.base import EncoderBlock, PatchEmbed
+
 
 @dataclass
 class Mast3rEncoderConfig:
@@ -200,118 +203,17 @@ def get_positions_grid(height: int, width: int) -> mx.array:
     return mx.array(positions[None, :, :], dtype=mx.int32)  # [1, H*W, 2]
 
 
-class Mast3rAttention(nn.Module):
-    """Multi-head self-attention with 2D RoPE and fused SDPA."""
-
-    def __init__(self, config: Mast3rEncoderConfig, rope: RoPE2D | None = None):
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-        dim = config.embed_dim
-        self.qkv = nn.Linear(dim, 3 * dim)
-        self.proj = nn.Linear(dim, dim)
-
-        # Shared RoPE2D instance
-        self.rope = rope
-
-    def __call__(self, x: mx.array, positions: mx.array) -> mx.array:
-        """Forward pass.
-
-        Args:
-            x: [B, N, D] input tokens
-            positions: [B, N, 2] position indices (y, x)
-
-        Returns:
-            [B, N, D] output tokens
-        """
-        B, N, D = x.shape
-
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = (
-            qkv[:, :, 0].transpose(0, 2, 1, 3),
-            qkv[:, :, 1].transpose(0, 2, 1, 3),
-            qkv[:, :, 2].transpose(0, 2, 1, 3),
-        )
-
-        # Apply RoPE to q and k
-        if self.rope is not None:
-            q = self.rope(q, positions)
-            k = self.rope(k, positions)
-
-        # Fused SDPA
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
-
-        return self.proj(out.transpose(0, 2, 1, 3).reshape(B, N, D))
-
-
-class Mast3rMLP(nn.Module):
-    """MLP with approximate GELU."""
-
-    def __init__(self, config: Mast3rEncoderConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.embed_dim, config.mlp_dim)
-        self.fc2 = nn.Linear(config.mlp_dim, config.embed_dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu_approx(self.fc1(x)))
-
-
-class Mast3rBlock(nn.Module):
-    """MASt3R encoder block."""
-
-    def __init__(self, config: Mast3rEncoderConfig, rope: RoPE2D | None = None):
-        super().__init__()
-        self.embed_dim = config.embed_dim
-
-        # LayerNorm weights
-        self.norm1_weight = mx.ones((config.embed_dim,))
-        self.norm1_bias = mx.zeros((config.embed_dim,))
-        self.norm2_weight = mx.ones((config.embed_dim,))
-        self.norm2_bias = mx.zeros((config.embed_dim,))
-
-        self.attn = Mast3rAttention(config, rope=rope)
-        self.mlp = Mast3rMLP(config)
-
-    def __call__(self, x: mx.array, positions: mx.array) -> mx.array:
-        """Forward pass.
-
-        Args:
-            x: [B, N, D] input tokens
-            positions: [B, N, 2] position indices (y, x)
-
-        Returns:
-            [B, N, D] output tokens
-        """
-        # Pre-norm attention
-        normed1 = mx.fast.layer_norm(x, self.norm1_weight, self.norm1_bias, eps=1e-6)
-        x = x + self.attn(normed1, positions)
-
-        # Pre-norm MLP
-        normed2 = mx.fast.layer_norm(x, self.norm2_weight, self.norm2_bias, eps=1e-6)
-        x = x + self.mlp(normed2)
-
-        return x
-
-
-class Mast3rPatchEmbed(nn.Module):
-    """Patch embedding with 16x16 patches."""
-
-    def __init__(self, config: Mast3rEncoderConfig):
-        super().__init__()
-        self.config = config
-        self.proj = nn.Conv2d(
-            3,
-            config.embed_dim,
-            kernel_size=config.patch_size,
-            stride=config.patch_size,
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        B = x.shape[0]
-        x = self.proj(x)
-        return x.reshape(B, -1, self.config.embed_dim)
+def _create_mast3r_block(config: Mast3rEncoderConfig, rope: RoPE2D) -> EncoderBlock:
+    """Create a MASt3R encoder block with the correct configuration."""
+    return EncoderBlock(
+        embed_dim=config.embed_dim,
+        num_heads=config.num_heads,
+        head_dim=config.head_dim,
+        mlp_dim=config.mlp_dim,
+        rope=rope,
+        use_layer_scale=False,
+        fast_gelu=False,  # MASt3R uses gelu_approx for PyTorch correlation
+    )
 
 
 class Mast3rEncoder(nn.Module):
@@ -338,10 +240,10 @@ class Mast3rEncoder(nn.Module):
         self.rope = RoPE2D(freq=config.rope_theta)
 
         # Patch embedding
-        self.patch_embed = Mast3rPatchEmbed(config)
+        self.patch_embed = PatchEmbed(config.embed_dim, config.patch_size)
 
         # Encoder blocks with shared RoPE
-        self.blocks = [Mast3rBlock(config, rope=self.rope) for _ in range(config.depth)]
+        self.blocks = [_create_mast3r_block(config, self.rope) for _ in range(config.depth)]
 
         # Final norm
         self.norm_weight = mx.ones((config.embed_dim,))
@@ -382,7 +284,7 @@ class Mast3rEncoder(nn.Module):
             x = block(x, positions)
 
         # Apply enc_norm (matches PyTorch _encode_image output)
-        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=1e-6)
+        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=LAYER_NORM_EPS)
 
         return x
 
