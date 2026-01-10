@@ -23,14 +23,14 @@ sys.path.insert(0, str(REPO_ROOT / "thirdparty/dune"))
 sys.path.insert(0, str(REPO_ROOT / "thirdparty/mast3r"))
 sys.path.insert(0, str(REPO_ROOT / "thirdparty/mast3r/dust3r"))
 
-import mlx.core as mx
+import mlx.core as mx  # noqa: E402
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-WARMUP_ITERATIONS = 5
-BENCHMARK_ITERATIONS = 20
+WARMUP_ITERATIONS = 3
+BENCHMARK_ITERATIONS = 10
 
 PTH_DIR = Path.home() / ".cache/mast3r_runtime/checkpoints"
 SAFETENSORS_DIR = Path.home() / ".cache/mlx-mast3r"
@@ -165,7 +165,7 @@ def benchmark_dune_encoder(variant: str, resolution: int) -> dict:
     mlx_mean_ms = None
 
     # --- PyTorch MPS ---
-    print(f"\nPyTorch MPS...")
+    print("\nPyTorch MPS...")
     try:
         pt_model = load_pytorch_dune(variant, resolution)
 
@@ -206,7 +206,7 @@ def benchmark_dune_encoder(variant: str, resolution: int) -> dict:
         traceback.print_exc()
 
     # --- MLX ---
-    print(f"\nMLX FP16...")
+    print("\nMLX FP16...")
     try:
         mlx_engine = load_mlx_dune(variant, resolution)
 
@@ -341,23 +341,9 @@ def benchmark_mast3r_encoder() -> dict:
             features, ms = mlx_engine.infer(img)
             mlx_times.append(ms)
 
-        # Apply enc_norm to match PyTorch _encode_image output
-        # Note: PyTorch _encode_image returns features AFTER enc_norm
-        # but MLX encoder returns features BEFORE enc_norm (decoder applies it)
-        from safetensors import safe_open
-        import mlx.core as mx
-
-        safetensors_path = SAFETENSORS_DIR / "mast3r_vit_large" / "unified.safetensors"
-        with safe_open(str(safetensors_path), framework="numpy") as f:
-            enc_norm_weight = mx.array(f.get_tensor("enc_norm.weight"))
-            enc_norm_bias = mx.array(f.get_tensor("enc_norm.bias"))
-
-        features_mx = mx.array(features[None])  # Add batch dim
-        features_normed = mx.fast.layer_norm(
-            features_mx, enc_norm_weight, enc_norm_bias, eps=1e-6
-        )
-        mx.eval(features_normed)
-        mlx_features = np.array(features_normed[0])
+        # MLX encoder now applies enc_norm internally (line 294 in mast3r.py)
+        # so features are already normalized - no need to apply again
+        mlx_features = features
 
         mlx_mean_ms = np.mean(mlx_times)
         mlx_std_ms = np.std(mlx_times)
@@ -535,9 +521,9 @@ def load_mlx_dunemast3r_full(variant: str, resolution: int):
 
 def load_pytorch_dunemast3r_local(variant: str, resolution: int):
     """Load DuneMASt3R from local checkpoints using thirdparty/dune."""
-    inf = float("inf")  # Required for eval(mast3r_model_str)
+    inf = float("inf")  # noqa: F841  # Required for eval(mast3r_model_str)
     from model.dune import load_dune_encoder_from_checkpoint
-    from mast3r.model import AsymmetricMASt3R, AsymmetricMASt3RWithDUNEBackbone
+    from mast3r.model import AsymmetricMASt3R, AsymmetricMASt3RWithDUNEBackbone  # noqa: F401
 
     # Load encoder from local .pth using DUNE's own loader
     encoder_path = PTH_DIR / f"dune_vit{variant}14_{resolution}.pth"

@@ -25,7 +25,6 @@ Optimizations:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,18 +34,13 @@ import mlx.nn as nn
 import numpy as np
 
 from mlx_mast3r.constants import LAYER_NORM_EPS
+from mlx_mast3r.layers import MLP
 
 # Import shared components from mast3r decoder
 from mlx_mast3r.decoders.mast3r import (
     DecoderBlock,
-    DecoderCrossAttention,
-    DecoderSelfAttention,
-    DPTHead,
     FeatureFusionBlock,
-    ResidualConvUnit,
-    apply_rope_2d,
     bilinear_upsample_2x,
-    nearest_upsample_2x,
     precompute_rope_2d,
 )
 
@@ -290,16 +284,9 @@ class DuneMast3rDecoder(nn.Module):
         # Input: enc_dim + dec_dim (768+768=1536 for base, 384+768=1152 for small)
         # Output: (desc_dim + 1) * patch_size^2 = 25 * 196 = 4900
         idim = config.encoder_dim + config.decoder_dim
-        self.head_local_features1 = nn.Sequential(
-            nn.Linear(idim, idim * 4),
-            nn.GELU(),
-            nn.Linear(idim * 4, (config.output_desc_dim + 1) * config.patch_size**2),
-        )
-        self.head_local_features2 = nn.Sequential(
-            nn.Linear(idim, idim * 4),
-            nn.GELU(),
-            nn.Linear(idim * 4, (config.output_desc_dim + 1) * config.patch_size**2),
-        )
+        out_dim = (config.output_desc_dim + 1) * config.patch_size**2
+        self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
+        self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
 
         # RoPE tables
         self._rope_cos: mx.array | None = None
@@ -465,7 +452,7 @@ class DuneMast3rDecoderEngine:
         # Load decoder
         self._load_decoder(decoder_path)
 
-        # Compile
+        # Compile (shapeless=True not compatible with dynamic ops)
         if self._compile:
             self._compiled_encoder = mx.compile(self.encoder.__call__)
             self._compiled_decoder = mx.compile(self.decoder.__call__)
@@ -535,6 +522,9 @@ class DuneMast3rDecoderEngine:
         else:
             feat1 = self.encoder(img1)
             feat2 = self.encoder(img2)
+
+        # Evaluate encoder outputs before decoder (prevents NaN from deep lazy graphs)
+        mx.eval(feat1, feat2)
 
         # Decode
         H = self.encoder_config.patch_h

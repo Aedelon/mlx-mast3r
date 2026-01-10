@@ -79,16 +79,17 @@ class RoPE2D:
     This matches the CroCo/MASt3R RoPE2D implementation.
     """
 
-    def __init__(self, freq: float = 100.0, F0: float = 1.0):
+    def __init__(self, freq: float = 100.0, F0: float = 1.0, max_pos: int | None = None):
         self.base = freq
         self.F0 = F0
+        self.max_pos = max_pos  # Pre-set to avoid GPU→CPU sync
         self._cos_cache: dict[tuple, mx.array] = {}
         self._sin_cache: dict[tuple, mx.array] = {}
 
     def get_cos_sin(
         self, D: int, max_pos: int, dtype: mx.Dtype
     ) -> tuple[mx.array, mx.array]:
-        """Get cached cos/sin tables.
+        """Get cached cos/sin tables (pure MLX GPU).
 
         Args:
             D: Half of head_dim (each half gets D dimensions)
@@ -100,20 +101,22 @@ class RoPE2D:
         """
         cache_key = (D, max_pos, dtype)
         if cache_key not in self._cos_cache:
+            # Pure MLX computation (no NumPy transfer)
             # inv_freq: [D//2]
-            inv_freq = self.F0 / (self.base ** (np.arange(0, D, 2, dtype=np.float32) / D))
+            dim_range = mx.arange(0, D, 2, dtype=mx.float32)
+            inv_freq = self.F0 / (self.base ** (dim_range / D))
 
             # positions: [max_pos]
-            t = np.arange(max_pos, dtype=np.float32)
+            t = mx.arange(max_pos, dtype=mx.float32)
 
-            # freqs: [max_pos, D//2]
-            freqs = np.outer(t, inv_freq)
+            # freqs: [max_pos, D//2] - outer product
+            freqs = t[:, None] * inv_freq[None, :]
 
             # Double frequencies to match head_dim//2: [max_pos, D]
-            freqs = np.concatenate([freqs, freqs], axis=-1)
+            freqs = mx.concatenate([freqs, freqs], axis=-1)
 
-            self._cos_cache[cache_key] = mx.array(np.cos(freqs), dtype=dtype)
-            self._sin_cache[cache_key] = mx.array(np.sin(freqs), dtype=dtype)
+            self._cos_cache[cache_key] = mx.cos(freqs).astype(dtype)
+            self._sin_cache[cache_key] = mx.sin(freqs).astype(dtype)
 
         return self._cos_cache[cache_key], self._sin_cache[cache_key]
 
@@ -157,7 +160,7 @@ class RoPE2D:
         tokens: mx.array,
         positions: mx.array,
     ) -> mx.array:
-        """Apply 2D RoPE to tokens.
+        """Apply 2D RoPE to tokens (single tensor, legacy interface).
 
         Args:
             tokens: [B, heads, N, head_dim]
@@ -169,8 +172,8 @@ class RoPE2D:
         head_dim = tokens.shape[-1]
         D = head_dim // 2  # Each half gets D dimensions
 
-        # Get cos/sin tables
-        max_pos = int(positions.max()) + 1
+        # Get cos/sin tables (use pre-set max_pos to avoid GPU→CPU sync)
+        max_pos = self.max_pos if self.max_pos is not None else int(positions.max()) + 1
         cos, sin = self.get_cos_sin(D, max_pos, tokens.dtype)
 
         # Split tokens into y and x halves
@@ -188,19 +191,58 @@ class RoPE2D:
         # Concatenate back
         return mx.concatenate([y_rotated, x_rotated], axis=-1)
 
+    def apply_fused(
+        self,
+        q: mx.array,
+        k: mx.array,
+        positions: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply 2D RoPE to q and k using fused Metal kernel.
+
+        This is more efficient than calling __call__ twice because:
+        1. Single kernel launch for both q and k
+        2. Better memory locality
+        3. Reduced intermediate allocations
+
+        Args:
+            q, k: [B, heads, N, head_dim]
+            positions: [B, N, 2] where positions[:,:,0] = y, positions[:,:,1] = x
+
+        Returns:
+            (q_rotated, k_rotated) with same shapes as inputs
+        """
+        from mlx_mast3r.kernels.rope2d import apply_rope_2d_fused
+
+        head_dim = q.shape[-1]
+        D = head_dim // 2
+
+        # Get cos/sin tables (use pre-set max_pos to avoid GPU→CPU sync)
+        max_pos = self.max_pos if self.max_pos is not None else int(positions.max()) + 1
+        cos, sin = self.get_cos_sin(D, max_pos, q.dtype)
+
+        # Kernel expects [N, 2] positions, all batches share same positions
+        pos = positions[0] if positions.ndim == 3 else positions
+
+        return apply_rope_2d_fused(q, k, cos, sin, pos)
+
 
 def get_positions_grid(height: int, width: int) -> mx.array:
-    """Generate position grid for patches.
+    """Generate position grid for patches (pure MLX GPU).
 
     Returns:
         positions: [1, H*W, 2] where each position is (y, x)
     """
-    y = np.arange(height)
-    x = np.arange(width)
-    # cartesian_prod equivalent: all (y, x) pairs in row-major order
-    grid_y, grid_x = np.meshgrid(y, x, indexing='ij')
-    positions = np.stack([grid_y.flatten(), grid_x.flatten()], axis=-1)
-    return mx.array(positions[None, :, :], dtype=mx.int32)  # [1, H*W, 2]
+    # Pure MLX computation (no NumPy transfer)
+    y = mx.arange(height, dtype=mx.int32)
+    x = mx.arange(width, dtype=mx.int32)
+
+    # Create meshgrid equivalent: broadcast y to [H, W] and x to [H, W]
+    grid_y = mx.broadcast_to(y[:, None], (height, width))
+    grid_x = mx.broadcast_to(x[None, :], (height, width))
+
+    # Stack and reshape to [1, H*W, 2]
+    positions = mx.stack([grid_y.flatten(), grid_x.flatten()], axis=-1)
+    return positions[None, :, :]  # [1, H*W, 2]
 
 
 def _create_mast3r_block(config: Mast3rEncoderConfig, rope: RoPE2D) -> EncoderBlock:
@@ -212,7 +254,7 @@ def _create_mast3r_block(config: Mast3rEncoderConfig, rope: RoPE2D) -> EncoderBl
         mlp_dim=config.mlp_dim,
         rope=rope,
         use_layer_scale=False,
-        fast_gelu=False,  # MASt3R uses gelu_approx for PyTorch correlation
+        fast_gelu=True,  # gelu_fast_approx for performance
     )
 
 
@@ -237,7 +279,9 @@ class Mast3rEncoder(nn.Module):
         self.config = config
 
         # RoPE2D - shared across all attention layers
-        self.rope = RoPE2D(freq=config.rope_theta)
+        # Pre-set max_pos to avoid GPU→CPU sync during forward pass
+        max_pos = max(config.patch_h, config.patch_w)
+        self.rope = RoPE2D(freq=config.rope_theta, max_pos=max_pos)
 
         # Patch embedding
         self.patch_embed = PatchEmbed(config.embed_dim, config.patch_size)
@@ -368,15 +412,15 @@ class Mast3rEncoderEngine:
         self.model.load_weights(list(weights.items()), strict=False)
         mx.eval(self.model.parameters())
 
-        # Compile
+        # Compile (shapeless=True not compatible with dynamic ops)
         if self._compile:
             self._compiled_forward = mx.compile(self.model.__call__)
 
         self._loaded = True
 
-    def _convert_conv(self, w: np.ndarray) -> mx.array:
+    def _convert_conv(self, w) -> mx.array:
         """Convert PyTorch conv weight [O,I,H,W] -> MLX [O,H,W,I]."""
-        return mx.array(np.transpose(w, (0, 2, 3, 1)))
+        return mx.array(w).transpose(0, 2, 3, 1)
 
     def __call__(self, x: mx.array) -> mx.array:
         """Run inference."""
@@ -394,10 +438,10 @@ class Mast3rEncoderEngine:
         """Run inference on numpy image [H,W,3] uint8."""
         import time
 
-        # Preprocess (MASt3R normalization)
-        x = img.astype(np.float32) / 255.0
+        # Preprocess (MASt3R normalization) - pure MLX
+        x = mx.array(img).astype(mx.float32) / 255.0
         x = (x - 0.5) / 0.5
-        x = mx.array(x[None, :, :, :])
+        x = x[None, :, :, :]
 
         t0 = time.perf_counter()
         out = self(x)

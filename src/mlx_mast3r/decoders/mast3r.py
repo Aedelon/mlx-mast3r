@@ -15,7 +15,7 @@ Optimizations:
 - mx.fast.layer_norm
 - mx.compile()
 - FP16/BF16 precision
-- 2D RoPE in decoder attention
+- Fused Metal kernel for 2D RoPE (2x speedup)
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def precompute_rope_2d(
     theta: float = 100.0,
     dtype: mx.Dtype = mx.float32,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Precompute 2D RoPE cos/sin tables.
+    """Precompute 2D RoPE cos/sin tables (pure MLX GPU).
 
     PyTorch RoPE2D:
     - Splits head_dim in half: first half for y-coords, second half for x-coords
@@ -84,31 +84,31 @@ def precompute_rope_2d(
     # RoPE dimension for each spatial direction (y and x)
     # PyTorch: D = head_dim // 2, then freqs = 1/(base^(2i/D)) for i in [0, D/2)
     D = head_dim // 2  # 32 for head_dim=64
-    freq_dim = D // 2  # 16
 
-    # Compute inverse frequencies (same as PyTorch)
-    inv_freq = 1.0 / (theta ** (np.arange(0, D, 2, dtype=np.float32) / D))
+    # Pure MLX computation (no NumPy transfer)
+    dim_range = mx.arange(0, D, 2, dtype=mx.float32)
+    inv_freq = 1.0 / (theta ** (dim_range / D))
 
     # Max position is max(height, width)
     max_pos = max(height, width)
-    t = np.arange(max_pos, dtype=np.float32)
+    t = mx.arange(max_pos, dtype=mx.float32)
 
-    # Compute freqs: [max_pos, freq_dim]
-    freqs = np.outer(t, inv_freq)
+    # Compute freqs: [max_pos, freq_dim] via outer product
+    freqs = t[:, None] * inv_freq[None, :]
     # Double the freqs for the full dimension (PyTorch does cat((freqs, freqs)))
-    freqs_full = np.concatenate([freqs, freqs], axis=-1)  # [max_pos, D]
+    freqs_full = mx.concatenate([freqs, freqs], axis=-1)  # [max_pos, D]
 
-    cos_table = mx.array(np.cos(freqs_full), dtype=dtype)
-    sin_table = mx.array(np.sin(freqs_full), dtype=dtype)
+    cos_table = mx.cos(freqs_full).astype(dtype)
+    sin_table = mx.sin(freqs_full).astype(dtype)
 
-    # Compute position indices for each token in the grid
-    # PyTorch: torch.cartesian_prod(y, x) gives (y, x) pairs
-    y_pos = np.arange(height)
-    x_pos = np.arange(width)
-    # cartesian product: [[0,0], [0,1], ..., [0,W-1], [1,0], ...]
-    grid_y, grid_x = np.meshgrid(y_pos, x_pos, indexing='ij')
-    positions = np.stack([grid_y.flatten(), grid_x.flatten()], axis=-1)  # [N, 2]
-    positions = mx.array(positions, dtype=mx.int32)
+    # Compute position indices for each token in the grid (pure MLX)
+    y_pos = mx.arange(height, dtype=mx.int32)
+    x_pos = mx.arange(width, dtype=mx.int32)
+    # Create meshgrid equivalent
+    grid_y = mx.broadcast_to(y_pos[:, None], (height, width))
+    grid_x = mx.broadcast_to(x_pos[None, :], (height, width))
+    # Stack and reshape to [N, 2]
+    positions = mx.stack([grid_y.flatten(), grid_x.flatten()], axis=-1)
 
     return cos_table, sin_table, positions
 
@@ -120,7 +120,7 @@ def apply_rope_2d(
     sin: mx.array,
     positions: mx.array,
 ) -> tuple[mx.array, mx.array]:
-    """Apply 2D RoPE to query and key tensors.
+    """Apply 2D RoPE to query and key tensors using fused Metal kernel.
 
     PyTorch RoPE2D splits head_dim in half and applies 1D RoPE on each half
     with y-positions and x-positions respectively.
@@ -129,51 +129,13 @@ def apply_rope_2d(
         q, k: [B, nheads, N, head_dim]
         cos, sin: [max_pos, head_dim // 2]
         positions: [N, 2] - (y, x) indices for each token
+
+    Returns:
+        (q_rotated, k_rotated) with same shapes as inputs
     """
+    from mlx_mast3r.kernels.rope2d import apply_rope_2d_fused
 
-    def rotate_half(x: mx.array) -> mx.array:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return mx.concatenate([-x2, x1], axis=-1)
-
-    def apply_rope_1d(tokens: mx.array, pos1d: mx.array, cos_t: mx.array, sin_t: mx.array) -> mx.array:
-        """Apply 1D RoPE using position indices.
-
-        Args:
-            tokens: [B, nheads, N, D]
-            pos1d: [N] - position indices
-            cos_t, sin_t: [max_pos, D]
-        """
-        # Gather cos/sin for each token position: [N, D]
-        cos_gathered = cos_t[pos1d]  # [N, D]
-        sin_gathered = sin_t[pos1d]  # [N, D]
-
-        # Expand for broadcast: [1, 1, N, D]
-        cos_gathered = cos_gathered[None, None, :, :]
-        sin_gathered = sin_gathered[None, None, :, :]
-
-        return tokens * cos_gathered + rotate_half(tokens) * sin_gathered
-
-    # Split into y-features and x-features (first half and second half of head_dim)
-    head_dim = q.shape[-1]
-    q_y, q_x = q[..., :head_dim // 2], q[..., head_dim // 2:]
-    k_y, k_x = k[..., :head_dim // 2], k[..., head_dim // 2:]
-
-    # Get position indices for y and x
-    pos_y = positions[:, 0]  # [N]
-    pos_x = positions[:, 1]  # [N]
-
-    # Apply 1D RoPE to each half with corresponding positions
-    q_y = apply_rope_1d(q_y, pos_y, cos, sin)
-    q_x = apply_rope_1d(q_x, pos_x, cos, sin)
-    k_y = apply_rope_1d(k_y, pos_y, cos, sin)
-    k_x = apply_rope_1d(k_x, pos_x, cos, sin)
-
-    # Concatenate back
-    q_rotated = mx.concatenate([q_y, q_x], axis=-1)
-    k_rotated = mx.concatenate([k_y, k_x], axis=-1)
-
-    return q_rotated, k_rotated
+    return apply_rope_2d_fused(q, k, cos, sin, positions)
 
 
 class DecoderSelfAttention(nn.Module):
@@ -332,41 +294,43 @@ def _compute_bilinear_params(H: int, W: int, dtype_str: str) -> BilinearParams:
     dtype = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}[dtype_str]
     out_H, out_W = H * 2, W * 2
 
-    # Compute source coordinates
-    oh = np.arange(out_H, dtype=np.float32)
-    ow = np.arange(out_W, dtype=np.float32)
+    # Pure MLX computation (no NumPy transfer)
+    oh = mx.arange(out_H, dtype=mx.float32)
+    ow = mx.arange(out_W, dtype=mx.float32)
 
-    src_h = oh * (H - 1) / (out_H - 1) if out_H > 1 else np.zeros_like(oh)
-    src_w = ow * (W - 1) / (out_W - 1) if out_W > 1 else np.zeros_like(ow)
+    src_h = oh * (H - 1) / (out_H - 1) if out_H > 1 else mx.zeros_like(oh)
+    src_w = ow * (W - 1) / (out_W - 1) if out_W > 1 else mx.zeros_like(ow)
 
     # Floor indices
-    h0 = np.floor(src_h).astype(np.int32)
-    w0 = np.floor(src_w).astype(np.int32)
-    h1 = np.minimum(h0 + 1, H - 1)
-    w1 = np.minimum(w0 + 1, W - 1)
+    h0 = mx.floor(src_h).astype(mx.int32)
+    w0 = mx.floor(src_w).astype(mx.int32)
+    h1 = mx.minimum(h0 + 1, H - 1)
+    w1 = mx.minimum(w0 + 1, W - 1)
 
     # Fractional parts
-    fh = src_h - h0
-    fw = src_w - w0
+    fh = src_h - h0.astype(mx.float32)
+    fw = src_w - w0.astype(mx.float32)
 
-    # 2D weight grids
+    # 2D weight grids via broadcasting [out_H, out_W, 1]
     fh_2d = fh[:, None]
     fw_2d = fw[None, :]
 
-    w00 = mx.array((1 - fh_2d) * (1 - fw_2d), dtype=dtype)[:, :, None]
-    w01 = mx.array((1 - fh_2d) * fw_2d, dtype=dtype)[:, :, None]
-    w10 = mx.array(fh_2d * (1 - fw_2d), dtype=dtype)[:, :, None]
-    w11 = mx.array(fh_2d * fw_2d, dtype=dtype)[:, :, None]
+    w00 = ((1 - fh_2d) * (1 - fw_2d)).astype(dtype)[:, :, None]
+    w01 = ((1 - fh_2d) * fw_2d).astype(dtype)[:, :, None]
+    w10 = (fh_2d * (1 - fw_2d)).astype(dtype)[:, :, None]
+    w11 = (fh_2d * fw_2d).astype(dtype)[:, :, None]
 
-    # Index meshgrids
-    h0_2d, w0_2d = np.meshgrid(h0, w0, indexing="ij")
-    h1_2d, w1_2d = np.meshgrid(h1, w1, indexing="ij")
+    # Index meshgrids via broadcasting
+    h0_2d = mx.broadcast_to(h0[:, None], (out_H, out_W))
+    w0_2d = mx.broadcast_to(w0[None, :], (out_H, out_W))
+    h1_2d = mx.broadcast_to(h1[:, None], (out_H, out_W))
+    w1_2d = mx.broadcast_to(w1[None, :], (out_H, out_W))
 
     # Linear indices (flattened for gather)
-    idx00 = mx.array((h0_2d * W + w0_2d).flatten(), dtype=mx.int32)
-    idx01 = mx.array((h0_2d * W + w1_2d).flatten(), dtype=mx.int32)
-    idx10 = mx.array((h1_2d * W + w0_2d).flatten(), dtype=mx.int32)
-    idx11 = mx.array((h1_2d * W + w1_2d).flatten(), dtype=mx.int32)
+    idx00 = (h0_2d * W + w0_2d).flatten().astype(mx.int32)
+    idx01 = (h0_2d * W + w1_2d).flatten().astype(mx.int32)
+    idx10 = (h1_2d * W + w0_2d).flatten().astype(mx.int32)
+    idx11 = (h1_2d * W + w1_2d).flatten().astype(mx.int32)
 
     return (idx00, idx01, idx10, idx11, w00, w01, w10, w11)
 
@@ -387,31 +351,18 @@ def _get_bilinear_params(H: int, W: int, dtype: mx.Dtype) -> BilinearParams:
 
 
 def bilinear_upsample_2x(x: mx.array, align_corners: bool = True) -> mx.array:
-    """Bilinear upsampling by factor 2 with align_corners support.
+    """Bilinear upsampling by factor 2 using fused Metal kernel.
 
     Input: [B, H, W, C], Output: [B, 2H, 2W, C]
 
-    Uses cached indices/weights for repeated calls with same dimensions.
+    Uses a fused Metal kernel for ~2x speedup over separate gather/reshape ops.
     """
-    B, H, W, C = x.shape
-    out_H, out_W = H * 2, W * 2
-
     if not align_corners:
         return nearest_upsample_2x(x)
 
-    # Get cached parameters
-    idx00, idx01, idx10, idx11, w00, w01, w10, w11 = _get_bilinear_params(H, W, x.dtype)
+    from mlx_mast3r.kernels.bilinear import bilinear_upsample_2x_fused
 
-    # Flatten spatial dims for gather
-    x_flat = x.reshape(B, H * W, C)
-
-    # Gather and reshape
-    p00 = x_flat[:, idx00, :].reshape(B, out_H, out_W, C)
-    p01 = x_flat[:, idx01, :].reshape(B, out_H, out_W, C)
-    p10 = x_flat[:, idx10, :].reshape(B, out_H, out_W, C)
-    p11 = x_flat[:, idx11, :].reshape(B, out_H, out_W, C)
-
-    return p00 * w00 + p01 * w01 + p10 * w10 + p11 * w11
+    return bilinear_upsample_2x_fused(x)
 
 
 def nearest_upsample_2x(x: mx.array) -> mx.array:
@@ -670,16 +621,9 @@ class Mast3rDecoder(nn.Module):
         # Input: enc_dim + dec_dim = 1024 + 768 = 1792
         # Output: (desc_dim + 1) * patch_size^2 = 25 * 256 for pixel shuffle
         idim = config.encoder_dim + config.decoder_dim
-        self.head_local_features1 = nn.Sequential(
-            nn.Linear(idim, idim * 4),
-            nn.GELU(),
-            nn.Linear(idim * 4, (config.output_desc_dim + 1) * config.patch_size**2),
-        )
-        self.head_local_features2 = nn.Sequential(
-            nn.Linear(idim, idim * 4),
-            nn.GELU(),
-            nn.Linear(idim * 4, (config.output_desc_dim + 1) * config.patch_size**2),
-        )
+        out_dim = (config.output_desc_dim + 1) * config.patch_size**2
+        self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
+        self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
 
         # RoPE tables
         self._rope_cos: mx.array | None = None
@@ -826,15 +770,13 @@ class Mast3rDecoderEngine:
 
         The MASt3R checkpoint contains both encoder and decoder weights.
         """
-        from safetensors import safe_open
-
         # Load encoder
         self._load_encoder(path)
 
         # Load decoder
         self._load_decoder(path)
 
-        # Compile
+        # Compile (shapeless=True not compatible with dynamic ops)
         if self._compile:
             self._compiled_encoder = mx.compile(self.encoder.__call__)
             self._compiled_decoder = mx.compile(self.decoder.__call__)
@@ -919,6 +861,9 @@ class Mast3rDecoderEngine:
         else:
             feat1 = self.encoder(img1)
             feat2 = self.encoder(img2)
+
+        # Evaluate encoder outputs before decoder (prevents NaN from deep lazy graphs)
+        mx.eval(feat1, feat2)
 
         # Decode
         H = self.encoder_config.patch_h

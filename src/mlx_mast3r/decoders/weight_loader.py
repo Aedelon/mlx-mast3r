@@ -4,27 +4,64 @@
 This module provides modular functions for loading PyTorch checkpoint weights
 into MLX decoder models, handling the necessary tensor transpositions and
 key remapping.
+
+Supports both PyTorch format (requires transposition) and MLX-optimized format
+(pre-transposed, indicated by metadata["format"] == "mlx_optimized").
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
-import numpy as np
-
-if TYPE_CHECKING:
-    from safetensors import SafetensorError
 
 
-def transpose_conv_weight(w: np.ndarray) -> np.ndarray:
-    """Transpose conv weight from PyTorch (O,I,H,W) to MLX (O,H,W,I)."""
-    return np.transpose(w, (0, 2, 3, 1))
+def is_mlx_optimized(path: str | Path) -> bool:
+    """Check if safetensors file is MLX-optimized (pre-transposed).
+
+    MLX-optimized files have metadata["format"] == "mlx_optimized".
+    """
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="numpy") as f:
+        metadata = f.metadata()
+        return metadata is not None and metadata.get("format") == "mlx_optimized"
 
 
-def transpose_conv_transpose_weight(w: np.ndarray) -> np.ndarray:
-    """Transpose ConvTranspose weight from PyTorch (I,O,H,W) to MLX (O,H,W,I)."""
-    return np.transpose(w, (1, 2, 3, 0))
+def get_mlx_optimized_path(path: str | Path) -> Path | None:
+    """Get MLX-optimized version path if it exists.
+
+    For 'model.safetensors', looks for 'model_mlx.safetensors'.
+    Returns None if not found.
+    """
+    path = Path(path)
+    mlx_path = path.parent / (path.stem + "_mlx.safetensors")
+    return mlx_path if mlx_path.exists() else None
+
+
+def transpose_conv_weight(w, pre_transposed: bool = False) -> mx.array:
+    """Transpose conv weight from PyTorch (O,I,H,W) to MLX (O,H,W,I).
+
+    Args:
+        w: Weight tensor (numpy or mx.array).
+        pre_transposed: If True, skip transposition (already MLX format).
+    """
+    if pre_transposed:
+        return mx.array(w)
+    return mx.array(w).transpose(0, 2, 3, 1)
+
+
+def transpose_conv_transpose_weight(w, pre_transposed: bool = False) -> mx.array:
+    """Transpose ConvTranspose weight from PyTorch (I,O,H,W) to MLX (O,H,W,I).
+
+    Args:
+        w: Weight tensor (numpy or mx.array).
+        pre_transposed: If True, skip transposition (already MLX format).
+    """
+    if pre_transposed:
+        return mx.array(w)
+    return mx.array(w).transpose(1, 2, 3, 0)
 
 
 def load_basic_params(
@@ -121,17 +158,13 @@ def load_decoder_block(
         )
 
         # Combine K and V into KV
-        k_weight = f.get_tensor(f"{src_prefix}cross_attn.projk.weight")
-        v_weight = f.get_tensor(f"{src_prefix}cross_attn.projv.weight")
-        weights[f"{dst_prefix}cross_attn.kv.weight"] = mx.array(
-            np.concatenate([k_weight, v_weight], axis=0)
-        )
+        k_weight = mx.array(f.get_tensor(f"{src_prefix}cross_attn.projk.weight"))
+        v_weight = mx.array(f.get_tensor(f"{src_prefix}cross_attn.projv.weight"))
+        weights[f"{dst_prefix}cross_attn.kv.weight"] = mx.concatenate([k_weight, v_weight], axis=0)
 
-        k_bias = f.get_tensor(f"{src_prefix}cross_attn.projk.bias")
-        v_bias = f.get_tensor(f"{src_prefix}cross_attn.projv.bias")
-        weights[f"{dst_prefix}cross_attn.kv.bias"] = mx.array(
-            np.concatenate([k_bias, v_bias], axis=0)
-        )
+        k_bias = mx.array(f.get_tensor(f"{src_prefix}cross_attn.projk.bias"))
+        v_bias = mx.array(f.get_tensor(f"{src_prefix}cross_attn.projv.bias"))
+        weights[f"{dst_prefix}cross_attn.kv.bias"] = mx.concatenate([k_bias, v_bias], axis=0)
 
         # Output projection
         weights[f"{dst_prefix}cross_attn.proj.weight"] = mx.array(
@@ -179,6 +212,7 @@ def load_dpt_head(
     weights: dict[str, mx.array],
     src_head: str,
     dst_head: str,
+    pre_transposed: bool = False,
 ) -> None:
     """Load DPT head weights.
 
@@ -188,19 +222,20 @@ def load_dpt_head(
         weights: Dictionary to populate with loaded weights.
         src_head: Source head name (e.g., "downstream_head1").
         dst_head: Destination head name (e.g., "head1").
+        pre_transposed: If True, conv weights are already in MLX format.
     """
+    pt = pre_transposed  # shorthand
+
     # act_postprocess layer 0: Conv + ConvTranspose (upsample 4x)
     if f"{src_head}.dpt.act_postprocess.0.0.weight" in keys:
-        weights[f"{dst_head}.act_postprocess_0_conv.weight"] = mx.array(
-            transpose_conv_weight(f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.weight"))
+        weights[f"{dst_head}.act_postprocess_0_conv.weight"] = transpose_conv_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_0_conv.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.bias")
         )
-        weights[f"{dst_head}.act_postprocess_0_up.weight"] = mx.array(
-            transpose_conv_transpose_weight(
-                f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.weight")
-            )
+        weights[f"{dst_head}.act_postprocess_0_up.weight"] = transpose_conv_transpose_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_0_up.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.bias")
@@ -208,16 +243,14 @@ def load_dpt_head(
 
     # act_postprocess layer 1: Conv + ConvTranspose (upsample 2x)
     if f"{src_head}.dpt.act_postprocess.1.0.weight" in keys:
-        weights[f"{dst_head}.act_postprocess_1_conv.weight"] = mx.array(
-            transpose_conv_weight(f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.weight"))
+        weights[f"{dst_head}.act_postprocess_1_conv.weight"] = transpose_conv_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_1_conv.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.bias")
         )
-        weights[f"{dst_head}.act_postprocess_1_up.weight"] = mx.array(
-            transpose_conv_transpose_weight(
-                f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.weight")
-            )
+        weights[f"{dst_head}.act_postprocess_1_up.weight"] = transpose_conv_transpose_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_1_up.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.bias")
@@ -225,8 +258,8 @@ def load_dpt_head(
 
     # act_postprocess layer 2: Conv only
     if f"{src_head}.dpt.act_postprocess.2.0.weight" in keys:
-        weights[f"{dst_head}.act_postprocess_2_conv.weight"] = mx.array(
-            transpose_conv_weight(f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.weight"))
+        weights[f"{dst_head}.act_postprocess_2_conv.weight"] = transpose_conv_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_2_conv.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.bias")
@@ -234,14 +267,14 @@ def load_dpt_head(
 
     # act_postprocess layer 3: Conv + Conv (downsample 2x)
     if f"{src_head}.dpt.act_postprocess.3.0.weight" in keys:
-        weights[f"{dst_head}.act_postprocess_3_conv.weight"] = mx.array(
-            transpose_conv_weight(f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.weight"))
+        weights[f"{dst_head}.act_postprocess_3_conv.weight"] = transpose_conv_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_3_conv.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.bias")
         )
-        weights[f"{dst_head}.act_postprocess_3_down.weight"] = mx.array(
-            transpose_conv_weight(f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.weight"))
+        weights[f"{dst_head}.act_postprocess_3_down.weight"] = transpose_conv_weight(
+            f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.weight"), pt
         )
         weights[f"{dst_head}.act_postprocess_3_down.bias"] = mx.array(
             f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.bias")
@@ -251,8 +284,8 @@ def load_dpt_head(
     for i in range(1, 5):
         layer_key = f"{src_head}.dpt.scratch.layer{i}_rn.weight"
         if layer_key in keys:
-            weights[f"{dst_head}.layer{i}_rn.weight"] = mx.array(
-                transpose_conv_weight(f.get_tensor(layer_key))
+            weights[f"{dst_head}.layer{i}_rn.weight"] = transpose_conv_weight(
+                f.get_tensor(layer_key), pt
             )
 
     # scratch.refinenet: feature fusion blocks
@@ -262,8 +295,8 @@ def load_dpt_head(
 
         # out_conv
         if f"{refine_prefix}.out_conv.weight" in keys:
-            weights[f"{dst_refine}.out_conv.weight"] = mx.array(
-                transpose_conv_weight(f.get_tensor(f"{refine_prefix}.out_conv.weight"))
+            weights[f"{dst_refine}.out_conv.weight"] = transpose_conv_weight(
+                f.get_tensor(f"{refine_prefix}.out_conv.weight"), pt
             )
             weights[f"{dst_refine}.out_conv.bias"] = mx.array(
                 f.get_tensor(f"{refine_prefix}.out_conv.bias")
@@ -274,8 +307,8 @@ def load_dpt_head(
             for conv in ["conv1", "conv2"]:
                 w_key = f"{refine_prefix}.{unit}.{conv}.weight"
                 if w_key in keys:
-                    weights[f"{dst_refine}.{unit}.{conv}.weight"] = mx.array(
-                        transpose_conv_weight(f.get_tensor(w_key))
+                    weights[f"{dst_refine}.{unit}.{conv}.weight"] = transpose_conv_weight(
+                        f.get_tensor(w_key), pt
                     )
                     weights[f"{dst_refine}.{unit}.{conv}.bias"] = mx.array(
                         f.get_tensor(f"{refine_prefix}.{unit}.{conv}.bias")
@@ -286,8 +319,8 @@ def load_dpt_head(
     for src_idx, dst_name in head_map:
         w_key = f"{src_head}.dpt.head.{src_idx}.weight"
         if w_key in keys:
-            weights[f"{dst_head}.{dst_name}.weight"] = mx.array(
-                transpose_conv_weight(f.get_tensor(w_key))
+            weights[f"{dst_head}.{dst_name}.weight"] = transpose_conv_weight(
+                f.get_tensor(w_key), pt
             )
             weights[f"{dst_head}.{dst_name}.bias"] = mx.array(
                 f.get_tensor(f"{src_head}.dpt.head.{src_idx}.bias")

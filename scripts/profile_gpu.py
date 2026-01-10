@@ -155,7 +155,6 @@ def profile_mast3r_decoder():
     engine.load(SAFETENSORS_DIR / "mast3r_vit_large" / "unified.safetensors")
 
     decoder = engine.decoder
-    config = decoder.config
 
     # Create encoder features (simulated)
     B, N = 1, 1344  # 32 * 42 patches

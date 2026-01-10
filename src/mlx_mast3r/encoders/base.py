@@ -67,10 +67,9 @@ class Attention(nn.Module):
             qkv[:, :, 2].transpose(0, 2, 1, 3),
         )
 
-        # Apply RoPE if configured
+        # Apply RoPE if configured (use fused kernel for q,k together)
         if self.rope is not None and positions is not None:
-            q = self.rope(q, positions)
-            k = self.rope(k, positions)
+            q, k = self.rope.apply_fused(q, k, positions)
 
         # Fused SDPA
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
