@@ -10,16 +10,8 @@ Usage:
 import time
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
-
 from mlx_mast3r import DUNE
-
-
-def load_image(path: Path) -> np.ndarray:
-    """Load image as numpy array."""
-    img = Image.open(path).convert("RGB")
-    return np.array(img)
+from mlx_mast3r.utils import load_image
 
 
 def main():
@@ -31,9 +23,11 @@ def main():
         print(f"Image not found: {image_path}")
         return
 
-    # Load image
+    resolution = 336
+
+    # Load and resize image
     print(f"Loading image: {image_path}")
-    image = load_image(image_path)
+    image = load_image(image_path, resolution=resolution)
     print(f"Image shape: {image.shape}")
 
     # Load DUNE model (weights auto-downloaded from HuggingFace)

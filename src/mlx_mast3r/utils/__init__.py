@@ -18,6 +18,11 @@ from mlx_mast3r.utils.postprocessing import (
     postprocess_desc_conf,
     postprocess_pts3d,
 )
+from mlx_mast3r.utils.preprocessing import (
+    load_image,
+    load_images,
+    resize_image,
+)
 
 __all__ = [
     "build_output_dict",
@@ -27,8 +32,11 @@ __all__ = [
     "download_dunemast3r_pth",
     "download_mast3r",
     "download_mast3r_pth",
+    "load_image",
+    "load_images",
     "normalize_descriptors",
     "postprocess_conf",
     "postprocess_desc_conf",
     "postprocess_pts3d",
+    "resize_image",
 ]

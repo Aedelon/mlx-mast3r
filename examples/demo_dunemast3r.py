@@ -10,16 +10,8 @@ Usage:
 import time
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
-
 from mlx_mast3r import DuneMast3r
-
-
-def load_image(path: Path) -> np.ndarray:
-    """Load image as numpy array."""
-    img = Image.open(path).convert("RGB")
-    return np.array(img)
+from mlx_mast3r.utils import load_image
 
 
 def main():
@@ -34,12 +26,13 @@ def main():
         return
 
     img1_path, img2_path = images[0], images[1]
+    resolution = 336
 
-    # Load images
+    # Load and resize images
     print(f"Image 1: {img1_path.name}")
     print(f"Image 2: {img2_path.name}")
-    img1 = load_image(img1_path)
-    img2 = load_image(img2_path)
+    img1 = load_image(img1_path, resolution=resolution)
+    img2 = load_image(img2_path, resolution=resolution)
     print(f"Image shapes: {img1.shape}, {img2.shape}")
 
     # Load DuneMASt3R model (weights auto-downloaded from HuggingFace)
