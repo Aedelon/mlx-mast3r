@@ -31,6 +31,7 @@ def load_basic_params(
     f: Any,
     keys: list[str],
     weights: dict[str, mx.array],
+    prefix: str = "",
 ) -> None:
     """Load basic decoder parameters (embed, norms).
 
@@ -38,21 +39,26 @@ def load_basic_params(
         f: SafeTensors file handle.
         keys: List of available keys in the file.
         weights: Dictionary to populate with loaded weights.
+        prefix: Optional prefix for source keys (e.g., "mast3r." for DUNE).
     """
     # decoder_embed
-    if "decoder_embed.weight" in keys:
-        weights["decoder_embed.weight"] = mx.array(f.get_tensor("decoder_embed.weight"))
-        weights["decoder_embed.bias"] = mx.array(f.get_tensor("decoder_embed.bias"))
+    if f"{prefix}decoder_embed.weight" in keys:
+        weights["decoder_embed.weight"] = mx.array(f.get_tensor(f"{prefix}decoder_embed.weight"))
+        weights["decoder_embed.bias"] = mx.array(f.get_tensor(f"{prefix}decoder_embed.bias"))
 
     # enc_norm
-    if "enc_norm.weight" in keys:
-        weights["enc_norm_weight"] = mx.array(f.get_tensor("enc_norm.weight"))
-        weights["enc_norm_bias"] = mx.array(f.get_tensor("enc_norm.bias"))
+    if f"{prefix}enc_norm.weight" in keys:
+        weights["enc_norm_weight"] = mx.array(f.get_tensor(f"{prefix}enc_norm.weight"))
+        weights["enc_norm_bias"] = mx.array(f.get_tensor(f"{prefix}enc_norm.bias"))
 
     # dec_norm
-    if "dec_norm.weight" in keys:
-        weights["dec_norm_weight"] = mx.array(f.get_tensor("dec_norm.weight"))
-        weights["dec_norm_bias"] = mx.array(f.get_tensor("dec_norm.bias"))
+    if f"{prefix}dec_norm.weight" in keys:
+        weights["dec_norm_weight"] = mx.array(f.get_tensor(f"{prefix}dec_norm.weight"))
+        weights["dec_norm_bias"] = mx.array(f.get_tensor(f"{prefix}dec_norm.bias"))
+
+    # mask_token (DUNE specific)
+    if f"{prefix}mask_token" in keys:
+        weights["mask_token"] = mx.array(f.get_tensor(f"{prefix}mask_token"))
 
 
 def load_decoder_block(
@@ -151,6 +157,7 @@ def load_all_decoder_blocks(
     keys: list[str],
     weights: dict[str, mx.array],
     decoder_depth: int,
+    prefix: str = "",
 ) -> None:
     """Load all decoder blocks (dec_blocks and dec_blocks2).
 
@@ -159,10 +166,11 @@ def load_all_decoder_blocks(
         keys: List of available keys in the file.
         weights: Dictionary to populate with loaded weights.
         decoder_depth: Number of decoder layers (typically 12).
+        prefix: Optional prefix for source keys (e.g., "mast3r." for DUNE).
     """
     for i in range(decoder_depth):
-        load_decoder_block(f, keys, weights, f"dec_blocks.{i}", f"dec_blocks.{i}.")
-        load_decoder_block(f, keys, weights, f"dec_blocks2.{i}", f"dec_blocks2.{i}.")
+        load_decoder_block(f, keys, weights, f"{prefix}dec_blocks.{i}", f"dec_blocks.{i}.")
+        load_decoder_block(f, keys, weights, f"{prefix}dec_blocks2.{i}", f"dec_blocks2.{i}.")
 
 
 def load_dpt_head(
@@ -290,6 +298,7 @@ def load_local_features(
     f: Any,
     keys: list[str],
     weights: dict[str, mx.array],
+    prefix: str = "",
 ) -> None:
     """Load local features MLP weights (for descriptors).
 
@@ -297,9 +306,10 @@ def load_local_features(
         f: SafeTensors file handle.
         keys: List of available keys in the file.
         weights: Dictionary to populate with loaded weights.
+        prefix: Optional prefix for source keys (e.g., "mast3r." for DUNE).
     """
     for head_idx in [1, 2]:
-        src = f"downstream_head{head_idx}.head_local_features"
+        src = f"{prefix}downstream_head{head_idx}.head_local_features"
         dst = f"head_local_features{head_idx}"
 
         # fc1 -> layers.0, fc2 -> layers.2

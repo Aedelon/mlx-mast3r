@@ -408,52 +408,11 @@ class DuneMast3rDecoder(nn.Module):
         local_feat1 = local_feat1.transpose(0, 1, 4, 2, 5, 3).reshape(B, H1 * ps, W1 * ps, desc_dim)
         local_feat2 = local_feat2.transpose(0, 1, 4, 2, 5, 3).reshape(B, H2 * ps, W2 * ps, desc_dim)
 
-        # Split descriptors and desc_conf
-        desc1 = local_feat1[..., : self.config.output_desc_dim]
-        desc_conf1 = local_feat1[..., self.config.output_desc_dim :]
-        desc2 = local_feat2[..., : self.config.output_desc_dim]
-        desc_conf2 = local_feat2[..., self.config.output_desc_dim :]
+        # Build output dicts with post-processing
+        from mlx_mast3r.utils.postprocessing import build_output_dict
 
-        # Normalize descriptors
-        desc1 = desc1 / (mx.linalg.norm(desc1, axis=-1, keepdims=True) + 1e-8)
-        desc2 = desc2 / (mx.linalg.norm(desc2, axis=-1, keepdims=True) + 1e-8)
-
-        # Post-processing (matching MASt3R depth_mode='exp', conf_mode='exp')
-        def postprocess_pts3d(xyz: mx.array) -> mx.array:
-            """Apply depth_mode='exp': pts3d = xyz * expm1(norm(xyz))."""
-            d = mx.linalg.norm(xyz, axis=-1, keepdims=True)
-            xyz_normalized = xyz / mx.maximum(d, mx.array(1e-8))
-            return xyz_normalized * mx.expm1(d)
-
-        def postprocess_conf(x: mx.array, vmin: float = 1.0) -> mx.array:
-            """Apply conf_mode='exp': conf = vmin + exp(x)."""
-            return vmin + mx.exp(x)
-
-        def postprocess_desc_conf(x: mx.array, vmin: float = 0.0) -> mx.array:
-            """Apply desc_conf_mode='exp': desc_conf = vmin + exp(x)."""
-            return vmin + mx.exp(x)
-
-        # Apply post-processing
-        pts3d_1 = postprocess_pts3d(dpt_out1[..., :3])
-        pts3d_2 = postprocess_pts3d(dpt_out2[..., :3])
-        conf_1 = postprocess_conf(dpt_out1[..., 3:4])
-        conf_2 = postprocess_conf(dpt_out2[..., 3:4])
-        desc_conf1 = postprocess_desc_conf(desc_conf1)
-        desc_conf2 = postprocess_desc_conf(desc_conf2)
-
-        # Build output dicts
-        out1 = {
-            "pts3d": pts3d_1,
-            "conf": conf_1,
-            "desc": desc1,
-            "desc_conf": desc_conf1,
-        }
-        out2 = {
-            "pts3d": pts3d_2,
-            "conf": conf_2,
-            "desc": desc2,
-            "desc_conf": desc_conf2,
-        }
+        out1 = build_output_dict(dpt_out1, local_feat1, self.config.output_desc_dim)
+        out2 = build_output_dict(dpt_out2, local_feat2, self.config.output_desc_dim)
 
         return out1, out2
 
@@ -523,264 +482,26 @@ class DuneMast3rDecoderEngine:
         """
         from safetensors import safe_open
 
-        path = Path(path)
+        from mlx_mast3r.decoders.weight_loader import (
+            load_all_decoder_blocks,
+            load_basic_params,
+            load_dpt_head,
+            load_local_features,
+        )
 
-        weights = {}
+        path = Path(path)
+        prefix = "mast3r."  # DUNE decoder keys are prefixed
+
+        weights: dict[str, mx.array] = {}
         with safe_open(str(path), framework="numpy") as f:
             keys = list(f.keys())
 
-            # decoder_embed
-            if "mast3r.decoder_embed.weight" in keys:
-                weights["decoder_embed.weight"] = mx.array(
-                    f.get_tensor("mast3r.decoder_embed.weight")
-                )
-                weights["decoder_embed.bias"] = mx.array(f.get_tensor("mast3r.decoder_embed.bias"))
-
-            # enc_norm
-            if "mast3r.enc_norm.weight" in keys:
-                weights["enc_norm_weight"] = mx.array(f.get_tensor("mast3r.enc_norm.weight"))
-                weights["enc_norm_bias"] = mx.array(f.get_tensor("mast3r.enc_norm.bias"))
-
-            # dec_norm
-            if "mast3r.dec_norm.weight" in keys:
-                weights["dec_norm_weight"] = mx.array(f.get_tensor("mast3r.dec_norm.weight"))
-                weights["dec_norm_bias"] = mx.array(f.get_tensor("mast3r.dec_norm.bias"))
-
-            # mask_token
-            if "mast3r.mask_token" in keys:
-                weights["mask_token"] = mx.array(f.get_tensor("mast3r.mask_token"))
-
-            # Load decoder blocks
-            def load_decoder_block(src_prefix: str, dst_prefix: str) -> None:
-                """Load a single decoder block."""
-                if f"{src_prefix}norm1.weight" not in keys:
-                    return
-
-                # Self-attention norms
-                weights[f"{dst_prefix}norm1_weight"] = mx.array(
-                    f.get_tensor(f"{src_prefix}norm1.weight")
-                )
-                weights[f"{dst_prefix}norm1_bias"] = mx.array(
-                    f.get_tensor(f"{src_prefix}norm1.bias")
-                )
-
-                # Self-attention
-                weights[f"{dst_prefix}self_attn.qkv.weight"] = mx.array(
-                    f.get_tensor(f"{src_prefix}attn.qkv.weight")
-                )
-                weights[f"{dst_prefix}self_attn.qkv.bias"] = mx.array(
-                    f.get_tensor(f"{src_prefix}attn.qkv.bias")
-                )
-                weights[f"{dst_prefix}self_attn.proj.weight"] = mx.array(
-                    f.get_tensor(f"{src_prefix}attn.proj.weight")
-                )
-                weights[f"{dst_prefix}self_attn.proj.bias"] = mx.array(
-                    f.get_tensor(f"{src_prefix}attn.proj.bias")
-                )
-
-                # Cross-attention norms
-                if f"{src_prefix}norm2.weight" in keys:
-                    weights[f"{dst_prefix}norm2_weight"] = mx.array(
-                        f.get_tensor(f"{src_prefix}norm2.weight")
-                    )
-                    weights[f"{dst_prefix}norm2_bias"] = mx.array(
-                        f.get_tensor(f"{src_prefix}norm2.bias")
-                    )
-
-                if f"{src_prefix}norm_y.weight" in keys:
-                    weights[f"{dst_prefix}norm_y_weight"] = mx.array(
-                        f.get_tensor(f"{src_prefix}norm_y.weight")
-                    )
-                    weights[f"{dst_prefix}norm_y_bias"] = mx.array(
-                        f.get_tensor(f"{src_prefix}norm_y.bias")
-                    )
-
-                # Cross-attention - projq/projk/projv -> q + kv
-                cross_key = f"{src_prefix}cross_attn.projq.weight"
-                if cross_key in keys:
-                    weights[f"{dst_prefix}cross_attn.q.weight"] = mx.array(
-                        f.get_tensor(f"{src_prefix}cross_attn.projq.weight")
-                    )
-                    weights[f"{dst_prefix}cross_attn.q.bias"] = mx.array(
-                        f.get_tensor(f"{src_prefix}cross_attn.projq.bias")
-                    )
-
-                    # Combine K and V into KV
-                    k_weight = f.get_tensor(f"{src_prefix}cross_attn.projk.weight")
-                    v_weight = f.get_tensor(f"{src_prefix}cross_attn.projv.weight")
-                    kv_weight = np.concatenate([k_weight, v_weight], axis=0)
-                    weights[f"{dst_prefix}cross_attn.kv.weight"] = mx.array(kv_weight)
-
-                    k_bias = f.get_tensor(f"{src_prefix}cross_attn.projk.bias")
-                    v_bias = f.get_tensor(f"{src_prefix}cross_attn.projv.bias")
-                    kv_bias = np.concatenate([k_bias, v_bias], axis=0)
-                    weights[f"{dst_prefix}cross_attn.kv.bias"] = mx.array(kv_bias)
-
-                    weights[f"{dst_prefix}cross_attn.proj.weight"] = mx.array(
-                        f.get_tensor(f"{src_prefix}cross_attn.proj.weight")
-                    )
-                    weights[f"{dst_prefix}cross_attn.proj.bias"] = mx.array(
-                        f.get_tensor(f"{src_prefix}cross_attn.proj.bias")
-                    )
-
-                # MLP norm (norm3)
-                if f"{src_prefix}norm3.weight" in keys:
-                    weights[f"{dst_prefix}norm3_weight"] = mx.array(
-                        f.get_tensor(f"{src_prefix}norm3.weight")
-                    )
-                    weights[f"{dst_prefix}norm3_bias"] = mx.array(
-                        f.get_tensor(f"{src_prefix}norm3.bias")
-                    )
-
-                # MLP
-                weights[f"{dst_prefix}mlp.fc1.weight"] = mx.array(
-                    f.get_tensor(f"{src_prefix}mlp.fc1.weight")
-                )
-                weights[f"{dst_prefix}mlp.fc1.bias"] = mx.array(
-                    f.get_tensor(f"{src_prefix}mlp.fc1.bias")
-                )
-                weights[f"{dst_prefix}mlp.fc2.weight"] = mx.array(
-                    f.get_tensor(f"{src_prefix}mlp.fc2.weight")
-                )
-                weights[f"{dst_prefix}mlp.fc2.bias"] = mx.array(
-                    f.get_tensor(f"{src_prefix}mlp.fc2.bias")
-                )
-
-            # Load all decoder blocks
-            for i in range(self.decoder_config.decoder_depth):
-                load_decoder_block(f"mast3r.dec_blocks.{i}.", f"dec_blocks.{i}.")
-                load_decoder_block(f"mast3r.dec_blocks2.{i}.", f"dec_blocks2.{i}.")
-
-            # Helper to transpose conv weights from PyTorch to MLX
-            def transpose_conv_weight(w):
-                """PyTorch (O,I,H,W) -> MLX (O,H,W,I)."""
-                return np.transpose(w, (0, 2, 3, 1))
-
-            # Load DPT heads
-            def load_dpt_head(src_head: str, dst_head: str) -> None:
-                """Load DPT head weights."""
-                # act_postprocess layers
-                if f"{src_head}.dpt.act_postprocess.0.0.weight" in keys:
-                    weights[f"{dst_head}.act_postprocess_0_conv.weight"] = mx.array(
-                        transpose_conv_weight(
-                            f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.weight")
-                        )
-                    )
-                    weights[f"{dst_head}.act_postprocess_0_conv.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.0.0.bias")
-                    )
-                    # ConvTranspose: PyTorch (I,O,H,W) -> MLX (O,H,W,I)
-                    ct_w = f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.weight")
-                    weights[f"{dst_head}.act_postprocess_0_up.weight"] = mx.array(
-                        np.transpose(ct_w, (1, 2, 3, 0))
-                    )
-                    weights[f"{dst_head}.act_postprocess_0_up.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.0.1.bias")
-                    )
-
-                if f"{src_head}.dpt.act_postprocess.1.0.weight" in keys:
-                    weights[f"{dst_head}.act_postprocess_1_conv.weight"] = mx.array(
-                        transpose_conv_weight(
-                            f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.weight")
-                        )
-                    )
-                    weights[f"{dst_head}.act_postprocess_1_conv.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.1.0.bias")
-                    )
-                    ct_w = f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.weight")
-                    weights[f"{dst_head}.act_postprocess_1_up.weight"] = mx.array(
-                        np.transpose(ct_w, (1, 2, 3, 0))
-                    )
-                    weights[f"{dst_head}.act_postprocess_1_up.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.1.1.bias")
-                    )
-
-                if f"{src_head}.dpt.act_postprocess.2.0.weight" in keys:
-                    weights[f"{dst_head}.act_postprocess_2_conv.weight"] = mx.array(
-                        transpose_conv_weight(
-                            f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.weight")
-                        )
-                    )
-                    weights[f"{dst_head}.act_postprocess_2_conv.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.2.0.bias")
-                    )
-
-                if f"{src_head}.dpt.act_postprocess.3.0.weight" in keys:
-                    weights[f"{dst_head}.act_postprocess_3_conv.weight"] = mx.array(
-                        transpose_conv_weight(
-                            f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.weight")
-                        )
-                    )
-                    weights[f"{dst_head}.act_postprocess_3_conv.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.3.0.bias")
-                    )
-                    weights[f"{dst_head}.act_postprocess_3_down.weight"] = mx.array(
-                        transpose_conv_weight(
-                            f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.weight")
-                        )
-                    )
-                    weights[f"{dst_head}.act_postprocess_3_down.bias"] = mx.array(
-                        f.get_tensor(f"{src_head}.dpt.act_postprocess.3.1.bias")
-                    )
-
-                # layer_rn (try both naming conventions)
-                for i in range(1, 5):
-                    layer_key = f"{src_head}.dpt.scratch.layer{i}_rn.weight"
-                    if layer_key in keys:
-                        weights[f"{dst_head}.layer{i}_rn.weight"] = mx.array(
-                            transpose_conv_weight(f.get_tensor(layer_key))
-                        )
-
-                # refinenet
-                for i in range(1, 5):
-                    refine_prefix = f"{src_head}.dpt.scratch.refinenet{i}"
-                    dst_refine = f"{dst_head}.refinenet{i}"
-
-                    if f"{refine_prefix}.out_conv.weight" in keys:
-                        weights[f"{dst_refine}.out_conv.weight"] = mx.array(
-                            transpose_conv_weight(f.get_tensor(f"{refine_prefix}.out_conv.weight"))
-                        )
-                        weights[f"{dst_refine}.out_conv.bias"] = mx.array(
-                            f.get_tensor(f"{refine_prefix}.out_conv.bias")
-                        )
-
-                    for unit in ["resConfUnit1", "resConfUnit2"]:
-                        for conv in ["conv1", "conv2"]:
-                            w_key = f"{refine_prefix}.{unit}.{conv}.weight"
-                            if w_key in keys:
-                                weights[f"{dst_refine}.{unit}.{conv}.weight"] = mx.array(
-                                    transpose_conv_weight(f.get_tensor(w_key))
-                                )
-                                weights[f"{dst_refine}.{unit}.{conv}.bias"] = mx.array(
-                                    f.get_tensor(f"{refine_prefix}.{unit}.{conv}.bias")
-                                )
-
-                # head: output convolutions
-                head_map = [("0", "head_conv1"), ("2", "head_conv2"), ("4", "head_conv3")]
-                for src_idx, dst_name in head_map:
-                    w_key = f"{src_head}.dpt.head.{src_idx}.weight"
-                    if w_key in keys:
-                        weights[f"{dst_head}.{dst_name}.weight"] = mx.array(
-                            transpose_conv_weight(f.get_tensor(w_key))
-                        )
-                        weights[f"{dst_head}.{dst_name}.bias"] = mx.array(
-                            f.get_tensor(f"{src_head}.dpt.head.{src_idx}.bias")
-                        )
-
-            # Load both DPT heads
-            load_dpt_head("mast3r.downstream_head1", "head1")
-            load_dpt_head("mast3r.downstream_head2", "head2")
-
-            # Load local features MLP
-            for head_idx in [1, 2]:
-                src = f"mast3r.downstream_head{head_idx}.head_local_features"
-                dst = f"head_local_features{head_idx}"
-
-                if f"{src}.fc1.weight" in keys:
-                    weights[f"{dst}.layers.0.weight"] = mx.array(f.get_tensor(f"{src}.fc1.weight"))
-                    weights[f"{dst}.layers.0.bias"] = mx.array(f.get_tensor(f"{src}.fc1.bias"))
-                    weights[f"{dst}.layers.2.weight"] = mx.array(f.get_tensor(f"{src}.fc2.weight"))
-                    weights[f"{dst}.layers.2.bias"] = mx.array(f.get_tensor(f"{src}.fc2.bias"))
+            # Load all weight groups with prefix
+            load_basic_params(f, keys, weights, prefix=prefix)
+            load_all_decoder_blocks(f, keys, weights, self.decoder_config.decoder_depth, prefix=prefix)
+            load_dpt_head(f, keys, weights, f"{prefix}downstream_head1", "head1")
+            load_dpt_head(f, keys, weights, f"{prefix}downstream_head2", "head2")
+            load_local_features(f, keys, weights, prefix=prefix)
 
         # Cast to dtype
         if self.decoder_config.dtype != mx.float32:

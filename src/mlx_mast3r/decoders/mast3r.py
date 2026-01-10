@@ -20,6 +20,7 @@ Optimizations:
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -312,21 +313,23 @@ class DecoderBlock(nn.Module):
         return x
 
 
-# Global cache for bilinear upsample indices/weights
-_bilinear_cache: dict[tuple[int, int, str], tuple] = {}
+# Type alias for bilinear cache result
+BilinearParams = tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]
 
 
-def _get_bilinear_params(
-    H: int, W: int, dtype: mx.Dtype
-) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
-    """Get or compute cached bilinear upsample parameters.
+@functools.lru_cache(maxsize=8)
+def _compute_bilinear_params(H: int, W: int, dtype_str: str) -> BilinearParams:
+    """Compute bilinear upsample parameters (cached with LRU, max 8 resolutions).
 
-    Returns: (idx00, idx01, idx10, idx11, w00, w01, w10, w11)
+    Args:
+        H: Input height.
+        W: Input width.
+        dtype_str: String representation of dtype for cache key.
+
+    Returns:
+        (idx00, idx01, idx10, idx11, w00, w01, w10, w11) index and weight arrays.
     """
-    cache_key = (H, W, str(dtype))
-    if cache_key in _bilinear_cache:
-        return _bilinear_cache[cache_key]
-
+    dtype = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}[dtype_str]
     out_H, out_W = H * 2, W * 2
 
     # Compute source coordinates
@@ -365,9 +368,22 @@ def _get_bilinear_params(
     idx10 = mx.array((h1_2d * W + w0_2d).flatten(), dtype=mx.int32)
     idx11 = mx.array((h1_2d * W + w1_2d).flatten(), dtype=mx.int32)
 
-    result = (idx00, idx01, idx10, idx11, w00, w01, w10, w11)
-    _bilinear_cache[cache_key] = result
-    return result
+    return (idx00, idx01, idx10, idx11, w00, w01, w10, w11)
+
+
+def _get_bilinear_params(H: int, W: int, dtype: mx.Dtype) -> BilinearParams:
+    """Get cached bilinear upsample parameters.
+
+    Args:
+        H: Input height.
+        W: Input width.
+        dtype: MLX dtype.
+
+    Returns:
+        (idx00, idx01, idx10, idx11, w00, w01, w10, w11) index and weight arrays.
+    """
+    dtype_str = {mx.float32: "float32", mx.float16: "float16", mx.bfloat16: "bfloat16"}[dtype]
+    return _compute_bilinear_params(H, W, dtype_str)
 
 
 def bilinear_upsample_2x(x: mx.array, align_corners: bool = True) -> mx.array:
@@ -772,51 +788,10 @@ class Mast3rDecoder(nn.Module):
         local_feat2 = local_feat2.transpose(0, 1, 4, 2, 5, 3).reshape(B, H2 * ps, W2 * ps, desc_dim)
 
         # Split descriptors and desc_conf
-        desc1 = local_feat1[..., :self.config.output_desc_dim]
-        desc_conf1 = local_feat1[..., self.config.output_desc_dim:]
-        desc2 = local_feat2[..., :self.config.output_desc_dim]
-        desc_conf2 = local_feat2[..., self.config.output_desc_dim:]
+        from mlx_mast3r.utils.postprocessing import build_output_dict
 
-        # Normalize descriptors
-        desc1 = desc1 / (mx.linalg.norm(desc1, axis=-1, keepdims=True) + 1e-8)
-        desc2 = desc2 / (mx.linalg.norm(desc2, axis=-1, keepdims=True) + 1e-8)
-
-        # Post-processing (matching MASt3R depth_mode='exp', conf_mode='exp')
-        def postprocess_pts3d(xyz: mx.array) -> mx.array:
-            """Apply depth_mode='exp': pts3d = xyz * expm1(norm(xyz))."""
-            d = mx.linalg.norm(xyz, axis=-1, keepdims=True)
-            xyz_normalized = xyz / mx.maximum(d, mx.array(1e-8))
-            return xyz_normalized * mx.expm1(d)
-
-        def postprocess_conf(x: mx.array, vmin: float = 1.0) -> mx.array:
-            """Apply conf_mode='exp': conf = vmin + exp(x)."""
-            return vmin + mx.exp(x)
-
-        def postprocess_desc_conf(x: mx.array, vmin: float = 0.0) -> mx.array:
-            """Apply desc_conf_mode='exp': desc_conf = vmin + exp(x)."""
-            return vmin + mx.exp(x)
-
-        # Apply post-processing
-        pts3d_1 = postprocess_pts3d(dpt_out1[..., :3])
-        pts3d_2 = postprocess_pts3d(dpt_out2[..., :3])
-        conf_1 = postprocess_conf(dpt_out1[..., 3:4])
-        conf_2 = postprocess_conf(dpt_out2[..., 3:4])
-        desc_conf1 = postprocess_desc_conf(desc_conf1)
-        desc_conf2 = postprocess_desc_conf(desc_conf2)
-
-        # Build output dicts
-        out1 = {
-            "pts3d": pts3d_1,
-            "conf": conf_1,
-            "desc": desc1,
-            "desc_conf": desc_conf1,
-        }
-        out2 = {
-            "pts3d": pts3d_2,
-            "conf": conf_2,
-            "desc": desc2,
-            "desc_conf": desc_conf2,
-        }
+        out1 = build_output_dict(dpt_out1, local_feat1, self.config.output_desc_dim)
+        out2 = build_output_dict(dpt_out2, local_feat2, self.config.output_desc_dim)
 
         return out1, out2
 
