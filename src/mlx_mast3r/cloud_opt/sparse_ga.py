@@ -29,14 +29,17 @@ class SparseGAResult:
 
     imgs: list[np.ndarray]
     img_paths: list[str]
-    focals: mx.array  # [N]
+    focals: mx.array  # [N] optimized focals
     principal_points: mx.array  # [N, 2]
     cam2w: mx.array  # [N, 4, 4] camera-to-world
-    depthmaps: list[mx.array]  # [H, W] per image
+    depthmaps: list[mx.array]  # [H, W] per image (scaled by optimizer - use original_depthmaps for reconstruction)
     pts3d: list[mx.array]  # Sparse 3D points per image
     pts3d_colors: list[np.ndarray]  # Colors for 3D points
     confs: list[mx.array]  # Confidence maps per image
     canonical_paths: list[str] | None  # Cache paths
+    base_focals: mx.array | None = None  # [N] initial focal estimates from canonical views
+    original_depthmaps: list[mx.array] | None = None  # Original unscaled depthmaps from canonical views
+    depth_scales: mx.array | None = None  # [N] depth scaling factors from optimization
 
     @property
     def n_imgs(self) -> int:
@@ -70,6 +73,10 @@ class SparseGAResult:
     ) -> tuple[list[mx.array], list[mx.array], list[mx.array]]:
         """Get dense 3D points from depthmaps.
 
+        Uses the original unscaled depthmaps (from canonical views) combined
+        with optimized camera poses. The camera poses were optimized for scaled
+        points, so we need to adjust the translations.
+
         Args:
             clean_depth: Apply depth cleaning
             subsample: Subsampling factor
@@ -80,12 +87,20 @@ class SparseGAResult:
         pts3d_list = []
         depth_list = []
 
-        for i in range(self.n_imgs):
-            H, W = self.depthmaps[i].shape
-            depth = self.depthmaps[i]
+        # Use original unscaled depthmaps if available, otherwise fall back to scaled
+        depthmaps_to_use = self.original_depthmaps if self.original_depthmaps else self.depthmaps
 
-            # Build intrinsics
-            f = self.focals[i]
+        for i in range(self.n_imgs):
+            H, W = depthmaps_to_use[i].shape
+            depth = depthmaps_to_use[i]
+
+            # Use base_focals for unprojection since depths are in canonical space
+            # If base_focals not available, fall back to optimized focals
+            if self.base_focals is not None:
+                f = self.base_focals[i]
+            else:
+                f = self.focals[i]
+
             pp = self.principal_points[i]
             K = mx.array(
                 [
@@ -95,11 +110,25 @@ class SparseGAResult:
                 ]
             )
 
-            # Unproject to 3D
+            # Unproject to 3D using canonical focal
             pts3d = depthmap_to_pts3d(depth, K)
 
+            # Get pose and adjust translation for unscaled points
+            # The poses were optimized for pts3d * scale, so translations need to be
+            # divided by scale to work with unscaled pts3d
+            cam2w = self.cam2w[i].copy() if hasattr(self.cam2w[i], 'copy') else mx.array(self.cam2w[i])
+
+            if self.depth_scales is not None:
+                scale = self.depth_scales[i]
+                # Adjust translation: t_corrected = t / scale
+                cam2w = mx.array([
+                    [cam2w[0, 0], cam2w[0, 1], cam2w[0, 2], cam2w[0, 3] / scale],
+                    [cam2w[1, 0], cam2w[1, 1], cam2w[1, 2], cam2w[1, 3] / scale],
+                    [cam2w[2, 0], cam2w[2, 1], cam2w[2, 2], cam2w[2, 3] / scale],
+                    [cam2w[3, 0], cam2w[3, 1], cam2w[3, 2], cam2w[3, 3]],
+                ])
+
             # Transform to world coordinates
-            cam2w = self.cam2w[i]
             pts3d_world = geotrf(cam2w, pts3d.reshape(-1, 3)).reshape(H, W, 3)
 
             pts3d_list.append(pts3d_world)
@@ -1081,6 +1110,16 @@ def sparse_scene_optimizer(
         shared_intrinsics=shared_intrinsics,
     )
 
+    # Store original unscaled depths for later reconstruction
+    original_depthmaps = []
+    for i in range(n_imgs):
+        H, W = imsizes[i]
+        d_sub = init_depths[i]  # These are the unscaled depths
+        # Upsample to full resolution (nearest neighbor)
+        d_full = mx.repeat(mx.repeat(d_sub, subsample, axis=0), subsample, axis=1)
+        d_full = d_full[:H, :W]
+        original_depthmaps.append(d_full)
+
     # Run optimization
     if verbose:
         print("Running scene optimization...")
@@ -1098,6 +1137,7 @@ def sparse_scene_optimizer(
     focals = optimizer.get_focals()
     pps_out = optimizer.get_principal_points()
     depths = optimizer.get_depths()
+    depth_scales = mx.exp(optimizer.log_scales)  # Scaling factors for translation compensation
 
     # Compute final 3D points
     pts3d_list = []
@@ -1176,4 +1216,7 @@ def sparse_scene_optimizer(
         pts3d_colors=pts3d_colors,
         confs=confs_list,
         canonical_paths=canonical_paths,
+        base_focals=init_focals,  # Original focals from canonical views for depth compensation
+        original_depthmaps=original_depthmaps,  # Unscaled depths for correct pts3d reconstruction
+        depth_scales=depth_scales,  # Scaling factors for translation compensation
     )
