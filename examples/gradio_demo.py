@@ -77,15 +77,24 @@ def get_retrieval_model():
     return get_model("Retrieval")
 
 
-def get_resolution(model_name: str) -> int | tuple[int, int]:
-    """Get resolution for model."""
+def get_resolution(model_name: str) -> int:
+    """Get resolution for model (long edge size)."""
     if model_name == "MASt3R Full":
-        return (512, 672)
+        return 512
     elif model_name == "DuneMASt3R Base":
-        return (448, 448)  # Match model resolution (must be multiple of 14)
+        return 448  # Must be multiple of 14 (patch_size)
     elif model_name == "DuneMASt3R Small":
-        return (336, 336)  # Match model resolution
-    return (336, 336)  # Default for DUNE variants
+        return 336  # Must be multiple of 14
+    return 336  # Default for DUNE variants
+
+
+def get_model_params(model_name: str) -> dict:
+    """Get preprocessing params for model."""
+    if "DUNE" in model_name or "DuneMASt3R" in model_name:
+        return {"square_ok": True, "patch_size": 14}
+    else:
+        # MASt3R uses patch_size=16 and 4:3 aspect ratio
+        return {"square_ok": False, "patch_size": 16}
 
 
 # =============================================================================
@@ -332,9 +341,10 @@ def reconstruct_stereo(
 
     model = get_model(model_name)
     resolution = get_resolution(model_name)
+    params = get_model_params(model_name)
 
-    img1 = load_image(img1_path, resolution=resolution)
-    img2 = load_image(img2_path, resolution=resolution)
+    img1 = load_image(img1_path, resolution=resolution, **params)
+    img2 = load_image(img2_path, resolution=resolution, **params)
 
     t0 = time.perf_counter()
     out1, out2 = model.reconstruct(img1, img2)
@@ -456,13 +466,14 @@ def run_multiview_reconstruction(
     # Load model
     model = get_model(model_name)
     resolution = get_resolution(model_name)
+    params = get_model_params(model_name)
 
     # Load all images
     print(f"Loading {len(files)} images...")
     imgs_data = []
     imgs_np = []  # For retrieval
     for idx, filepath in enumerate(files):
-        img = load_image(filepath, resolution=resolution)
+        img = load_image(filepath, resolution=resolution, **params)
         imgs_np.append(img)
         imgs_data.append(
             {
