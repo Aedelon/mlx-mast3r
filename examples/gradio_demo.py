@@ -810,7 +810,7 @@ def update_multiview_visualization(
 # =============================================================================
 def create_demo():
     """Create unified Gradio demo."""
-    with gr.Blocks(title="MLX-MASt3R Demo", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="MLX-MASt3R Demo") as demo:
         gr.HTML(
             """
             <div style="text-align: center; padding: 20px;">
@@ -1249,5 +1249,6 @@ def create_demo():
 
 
 if __name__ == "__main__":
+    import gradio as gr
     demo = create_demo()
     demo.launch(share=False, server_port=7860)
