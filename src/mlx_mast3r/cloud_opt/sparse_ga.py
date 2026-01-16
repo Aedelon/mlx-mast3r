@@ -596,7 +596,8 @@ def prepare_canonical_data(
                         xy1 = corres_data["xy1"]
                         xy2 = corres_data["xy2"]
                         conf = corres_data["confs"]
-                        pixels[img2] = (mx.array(xy1), mx.array(conf))
+                        # Store (pts1, pts2, conf) - pts1 in current view, pts2 in other view
+                        pixels[img2] = (mx.array(xy1), mx.array(xy2), mx.array(conf))
 
                         i, j = imgs.index(img1), imgs.index(img2)
                         pairwise_scores[i, j] = score[2]
@@ -627,7 +628,9 @@ def prepare_canonical_data(
                         xy1 = corres_data["xy1"]
                         xy2 = corres_data["xy2"]
                         conf = corres_data["confs"]
-                        pixels[img1] = (mx.array(xy2), mx.array(conf))
+                        # Store (pts1, pts2, conf) - pts1 in current view, pts2 in other view
+                        # Here we're reading from img2's perspective, so xy2 is our pts1
+                        pixels[img1] = (mx.array(xy2), mx.array(xy1), mx.array(conf))
 
                     if img not in preds_21:
                         preds_21[img] = {}
@@ -818,17 +821,25 @@ def condense_data(
         all_pixels = []
         all_confs = []
 
-        for other_img, (pixels, conf) in pixels_data.items():
+        for other_img, pixel_data in pixels_data.items():
+            # Unpack (pts1, pts2, conf) or legacy (pts1, conf) format
+            if len(pixel_data) == 3:
+                pixels, pixels2, conf = pixel_data
+            else:
+                pixels, conf = pixel_data
+                pixels2 = pixels  # Fallback for legacy format
+
             all_pixels.append(pixels)
             all_confs.append(conf)
 
-            # Build correspondence entry
+            # Build correspondence entry with both pts1 and pts2
             other_idx = imgs.index(other_img)
             corres.append(
                 {
                     "idx1": idx,
                     "idx2": other_idx,
                     "pts1": pixels,
+                    "pts2": pixels2,
                     "weights": conf,
                 }
             )
@@ -1028,24 +1039,26 @@ def sparse_scene_optimizer(
         idx1 = c["idx1"]
         idx2 = c["idx2"]
         pts1 = c["pts1"]
+        pts2 = c.get("pts2", pts1)  # Use pts2 if available, fallback to pts1
         weights = c.get("weights", mx.ones(len(pts1)))
 
         # Find matching points in canonical data
-        # (Simplified: use pixel indices as point indices)
         H1, W1 = imsizes[idx1]
         H_sub1 = (H1 + subsample - 1) // subsample
         W_sub1 = (W1 + subsample - 1) // subsample
 
-        # Convert pixel coords to subsampled indices
+        # Convert pts1 pixel coords to subsampled indices
         pts1_sub = (pts1 / subsample).astype(mx.int32)
         pts1_sub = mx.clip(pts1_sub, 0, mx.array([W_sub1 - 1, H_sub1 - 1]))
         pts1_idx = pts1_sub[:, 1] * W_sub1 + pts1_sub[:, 0]
 
-        # For idx2, use same indices (simplified)
+        # Convert pts2 pixel coords to subsampled indices
         H2, W2 = imsizes[idx2]
         H_sub2 = (H2 + subsample - 1) // subsample
         W_sub2 = (W2 + subsample - 1) // subsample
-        pts2_idx = mx.clip(pts1_idx, 0, H_sub2 * W_sub2 - 1)
+        pts2_sub = (pts2 / subsample).astype(mx.int32)
+        pts2_sub = mx.clip(pts2_sub, 0, mx.array([W_sub2 - 1, H_sub2 - 1]))
+        pts2_idx = pts2_sub[:, 1] * W_sub2 + pts2_sub[:, 0]
 
         opt_corres.append(
             {
@@ -1054,7 +1067,7 @@ def sparse_scene_optimizer(
                 "pts1_idx": pts1_idx,
                 "pts2_idx": pts2_idx,
                 "pts1": pts1,
-                "pts2": pts1,  # Placeholder
+                "pts2": pts2,
                 "weights": weights,
             }
         )
