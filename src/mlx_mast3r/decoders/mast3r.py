@@ -251,7 +251,8 @@ class DecoderBlock(nn.Module):
         # MLP
         self.norm3_weight = mx.ones((dim,))
         self.norm3_bias = mx.zeros((dim,))
-        self.mlp = MLP(config.decoder_dim, config.mlp_dim)
+        # Use exact GELU (not fast approx) to match PyTorch decoder
+        self.mlp = MLP(config.decoder_dim, config.mlp_dim, fast_gelu=False)
 
     def set_rope_tables(self, cos: mx.array, sin: mx.array, positions: mx.array) -> None:
         """Propagate RoPE tables to self-attention and cross-attention."""
@@ -622,8 +623,9 @@ class Mast3rDecoder(nn.Module):
         # Output: (desc_dim + 1) * patch_size^2 = 25 * 256 for pixel shuffle
         idim = config.encoder_dim + config.decoder_dim
         out_dim = (config.output_desc_dim + 1) * config.patch_size**2
-        self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
-        self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
+        # Use exact GELU (not fast approx) to match PyTorch
+        self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=False)
+        self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=False)
 
         # RoPE tables
         self._rope_cos: mx.array | None = None
@@ -865,9 +867,11 @@ class Mast3rDecoderEngine:
         # Evaluate encoder outputs before decoder (prevents NaN from deep lazy graphs)
         mx.eval(feat1, feat2)
 
-        # Decode
-        H = self.encoder_config.patch_h
-        W = self.encoder_config.patch_w
+        # Compute patch dimensions from actual image size
+        _, H_img, W_img, _ = img1.shape
+        patch_size = self.encoder_config.patch_size
+        H = H_img // patch_size
+        W = W_img // patch_size
 
         if self._compiled_decoder:
             return self._compiled_decoder(feat1, feat2, (H, W), (H, W))

@@ -254,7 +254,7 @@ def _create_mast3r_block(config: Mast3rEncoderConfig, rope: RoPE2D) -> EncoderBl
         mlp_dim=config.mlp_dim,
         rope=rope,
         use_layer_scale=False,
-        fast_gelu=True,  # gelu_fast_approx for performance
+        fast_gelu=False,  # Use exact GELU to match PyTorch
     )
 
 
@@ -315,7 +315,9 @@ class Mast3rEncoder(nn.Module):
             [B, N, D] encoder features
         """
         B = x.shape[0]
-        H, W = self.config.patch_h, self.config.patch_w
+        # Compute patch grid from actual input size, not config
+        H = x.shape[1] // self.config.patch_size
+        W = x.shape[2] // self.config.patch_size
 
         # Get positions grid
         positions = self._get_positions(H, W, B)

@@ -14,14 +14,28 @@ __author__ = "Delanoe Pirard"
 from mlx_mast3r.encoders import DuneEncoder, Mast3rEncoder
 from mlx_mast3r.decoders import DuneMast3rDecoder, Mast3rDecoder
 from mlx_mast3r.models import DUNE, DuneMast3r, Mast3r, Mast3rFull
+from mlx_mast3r.retrieval import (
+    RetrievalModel,
+    compute_similarity_matrix,
+    make_pairs_retrieval,
+    select_pairs_from_retrieval,
+)
 
 __all__ = [
+    # Encoders
     "DuneEncoder",
     "Mast3rEncoder",
+    # Decoders
     "DuneMast3rDecoder",
     "Mast3rDecoder",
+    # High-level models
     "DUNE",
     "DuneMast3r",
     "Mast3r",
     "Mast3rFull",
+    # Retrieval
+    "RetrievalModel",
+    "compute_similarity_matrix",
+    "make_pairs_retrieval",
+    "select_pairs_from_retrieval",
 ]

@@ -285,8 +285,9 @@ class DuneMast3rDecoder(nn.Module):
         # Output: (desc_dim + 1) * patch_size^2 = 25 * 196 = 4900
         idim = config.encoder_dim + config.decoder_dim
         out_dim = (config.output_desc_dim + 1) * config.patch_size**2
-        self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
-        self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=True)
+        # Use exact GELU (not fast approx) to match PyTorch
+        self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=False)
+        self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=False)
 
         # RoPE tables
         self._rope_cos: mx.array | None = None
@@ -454,7 +455,12 @@ class DuneMast3rDecoderEngine:
 
         # Compile (shapeless=True not compatible with dynamic ops)
         if self._compile:
-            self._compiled_encoder = mx.compile(self.encoder.__call__)
+            # For DuneMASt3R, encoder must be called with apply_norm=False
+            # because we use the trained norm weights from the checkpoint
+            def encoder_no_norm(x: mx.array) -> mx.array:
+                return self.encoder(x, apply_norm=False)
+
+            self._compiled_encoder = mx.compile(encoder_no_norm)
             self._compiled_decoder = mx.compile(self.decoder.__call__)
 
         self._loaded = True
@@ -515,20 +521,31 @@ class DuneMast3rDecoderEngine:
         if not self._loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        # Encode
+        # Encode WITHOUT norm (DuneMASt3R has its own trained norm weights)
+        # We pass apply_norm=False to skip the encoder's default LayerNorm
         if self._compiled_encoder:
             feat1 = self._compiled_encoder(img1)
             feat2 = self._compiled_encoder(img2)
         else:
-            feat1 = self.encoder(img1)
-            feat2 = self.encoder(img2)
+            feat1 = self.encoder(img1, apply_norm=False)
+            feat2 = self.encoder(img2, apply_norm=False)
+
+        # Apply the trained encoder norm from DuneMASt3R checkpoint
+        feat1 = mx.fast.layer_norm(
+            feat1, self.decoder.enc_norm_weight, self.decoder.enc_norm_bias, eps=LAYER_NORM_EPS
+        )
+        feat2 = mx.fast.layer_norm(
+            feat2, self.decoder.enc_norm_weight, self.decoder.enc_norm_bias, eps=LAYER_NORM_EPS
+        )
 
         # Evaluate encoder outputs before decoder (prevents NaN from deep lazy graphs)
         mx.eval(feat1, feat2)
 
-        # Decode
-        H = self.encoder_config.patch_h
-        W = self.encoder_config.patch_w
+        # Compute patch dimensions from actual image size
+        _, H_img, W_img, _ = img1.shape
+        patch_size = self.encoder_config.patch_size
+        H = H_img // patch_size
+        W = W_img // patch_size
 
         if self._compiled_decoder:
             return self._compiled_decoder(feat1, feat2, (H, W), (H, W))
@@ -549,11 +566,15 @@ class DuneMast3rDecoderEngine:
         """
         import time
 
-        # DUNE preprocessing (same as MASt3R)
-        x1 = img1.astype(np.float32) / 255.0
-        x1 = (x1 - 0.5) / 0.5
+        # DUNE preprocessing uses ImageNet normalization (not MASt3R!)
+        # DUNE was trained with DINOv2 which uses ImageNet norm
+        imagenet_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        imagenet_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        x1 = img1.astype(np.float32) / 255.0  # [0, 1]
+        x1 = (x1 - imagenet_mean) / imagenet_std  # ImageNet norm
         x2 = img2.astype(np.float32) / 255.0
-        x2 = (x2 - 0.5) / 0.5
+        x2 = (x2 - imagenet_mean) / imagenet_std
 
         x1 = mx.array(x1[None, :, :, :])
         x2 = mx.array(x2[None, :, :, :])

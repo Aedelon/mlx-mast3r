@@ -83,8 +83,13 @@ def load_basic_params(
         weights["decoder_embed.weight"] = mx.array(f.get_tensor(f"{prefix}decoder_embed.weight"))
         weights["decoder_embed.bias"] = mx.array(f.get_tensor(f"{prefix}decoder_embed.bias"))
 
-    # enc_norm
-    if f"{prefix}enc_norm.weight" in keys:
+    # enc_norm - For DuneMASt3R, the actual trained weights are in "norm.weight" (no prefix)
+    # not in "mast3r.enc_norm.weight" which has default weights
+    if "norm.weight" in keys:
+        # Use the trained norm weights from DuneMASt3R checkpoint
+        weights["enc_norm_weight"] = mx.array(f.get_tensor("norm.weight"))
+        weights["enc_norm_bias"] = mx.array(f.get_tensor("norm.bias"))
+    elif f"{prefix}enc_norm.weight" in keys:
         weights["enc_norm_weight"] = mx.array(f.get_tensor(f"{prefix}enc_norm.weight"))
         weights["enc_norm_bias"] = mx.array(f.get_tensor(f"{prefix}enc_norm.bias"))
 

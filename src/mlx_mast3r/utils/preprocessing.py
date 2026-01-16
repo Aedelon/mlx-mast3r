@@ -9,33 +9,69 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from PIL.ImageOps import exif_transpose
+
+
+def _resize_pil_image(img: Image.Image, long_edge_size: int) -> Image.Image:
+    """Resize image so long edge equals long_edge_size, preserving aspect ratio."""
+    S = max(img.size)
+    if S > long_edge_size:
+        interp = Image.Resampling.LANCZOS
+    else:
+        interp = Image.Resampling.BICUBIC
+    new_size = tuple(int(round(x * long_edge_size / S)) for x in img.size)
+    return img.resize(new_size, interp)
 
 
 def load_image(
     path: str | Path,
     resolution: int | tuple[int, int] | None = None,
+    square_ok: bool = False,
+    patch_size: int = 16,
 ) -> np.ndarray:
-    """Load image from path and optionally resize.
+    """Load image from path with DUSt3R-compatible preprocessing.
+
+    Matches the original DUSt3R/MASt3R preprocessing:
+    - Resize long edge to `resolution`
+    - Crop to dimensions divisible by `patch_size`
+    - Force 4:3 aspect ratio unless `square_ok=True`
 
     Args:
         path: Path to image file
         resolution: Target resolution. Can be:
-            - int: square resolution (H=W=resolution)
-            - tuple (H, W): specific height and width
+            - int: long edge size (default DUSt3R behavior)
+            - tuple (H, W): specific height and width (direct resize)
             - None: keep original size
+        square_ok: If False, force 4:3 aspect ratio (default DUSt3R behavior)
+        patch_size: Patch size for encoder (16 for ViT)
 
     Returns:
         [H, W, 3] uint8 numpy array
     """
-    img = Image.open(path).convert("RGB")
+    img = exif_transpose(Image.open(path)).convert("RGB")
 
     if resolution is not None:
-        if isinstance(resolution, int):
-            size = (resolution, resolution)
+        if isinstance(resolution, tuple):
+            # Direct resize to specific (H, W)
+            size = (resolution[1], resolution[0])  # PIL uses (W, H)
+            img = img.resize(size, Image.Resampling.LANCZOS)
         else:
-            # PIL resize takes (W, H), but we use (H, W) convention
-            size = (resolution[1], resolution[0])
-        img = img.resize(size, Image.Resampling.LANCZOS)
+            # DUSt3R-style preprocessing
+            # 1. Resize long edge to resolution
+            img = _resize_pil_image(img, resolution)
+
+            # 2. Crop to patch_size-aligned dimensions
+            W, H = img.size
+            cx, cy = W // 2, H // 2
+
+            halfw = ((2 * cx) // patch_size) * patch_size / 2
+            halfh = ((2 * cy) // patch_size) * patch_size / 2
+
+            # 3. Force 4:3 ratio unless square_ok
+            if not square_ok and W == H:
+                halfh = 3 * halfw / 4
+
+            img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
 
     return np.array(img)
 

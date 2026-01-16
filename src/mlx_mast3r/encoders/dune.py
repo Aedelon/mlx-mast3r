@@ -37,7 +37,9 @@ class DuneConfig:
     head_dim: int = 64
     mlp_ratio: float = 4.0
     depth: int = 12
-    num_register_tokens: int = 4
+    # Note: DuneMASt3R uses backbone without register tokens (num_register_tokens=0)
+    # Standard DINOv2-reg has 4 register tokens
+    num_register_tokens: int = 0
     precision: Literal["fp32", "fp16", "bf16"] = "fp16"
 
     def __post_init__(self) -> None:
@@ -86,7 +88,7 @@ def _create_dune_block(config: DuneConfig) -> EncoderBlock:
         mlp_dim=config.mlp_dim,
         rope=None,  # DUNE doesn't use RoPE
         use_layer_scale=True,  # DINOv2 uses layer scale
-        fast_gelu=True,
+        fast_gelu=False,  # Use exact GELU to match PyTorch
     )
 
 
@@ -161,17 +163,21 @@ class DuneEncoder(nn.Module):
         interpolated = interpolated.reshape(1, H * W, D)
         return mx.concatenate([cls_embed, interpolated], axis=1)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, apply_norm: bool = True) -> mx.array:
         """Forward pass.
 
         Args:
             x: [B, H, W, 3] input image (NHWC format)
+            apply_norm: If True, apply final LayerNorm. Set to False when
+                using DuneMASt3R which has its own trained norm weights.
 
         Returns:
             [B, N, D] encoder features (patch tokens only, no CLS/register)
         """
         B = x.shape[0]
-        H, W = self.config.patch_h, self.config.patch_w
+        # Compute patch grid from actual input size, not config
+        H = x.shape[1] // self.config.patch_size
+        W = x.shape[2] // self.config.patch_size
 
         # Patch embedding
         x = self.patch_embed(x)
@@ -195,8 +201,9 @@ class DuneEncoder(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        # Final norm
-        x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=LAYER_NORM_EPS)
+        # Final norm (optional - skip when DuneMASt3R will apply its own trained norm)
+        if apply_norm:
+            x = mx.fast.layer_norm(x, self.norm_weight, self.norm_bias, eps=LAYER_NORM_EPS)
 
         # Return patch tokens only
         start_idx = 1 + self.config.num_register_tokens
@@ -235,7 +242,15 @@ class DuneEncoderEngine:
 
             # Tokens
             weights["cls_token"] = mx.array(f.get_tensor("encoder.cls_token"))
-            weights["register_tokens"] = mx.array(f.get_tensor("encoder.register_tokens"))
+
+            # Register tokens (optional - DuneMASt3R backbone has none)
+            if "encoder.register_tokens" in f.keys():
+                weights["register_tokens"] = mx.array(f.get_tensor("encoder.register_tokens"))
+            elif self.config.num_register_tokens > 0:
+                # Initialize with zeros if expected but not in weights
+                weights["register_tokens"] = mx.zeros(
+                    (1, self.config.num_register_tokens, self.config.embed_dim)
+                )
 
             # Position embeddings
             pos_embed = f.get_tensor("encoder.pos_embed")

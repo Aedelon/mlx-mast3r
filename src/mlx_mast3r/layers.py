@@ -17,8 +17,8 @@ class MLP(nn.Module):
         in_dim: Input dimension.
         hidden_dim: Hidden layer dimension.
         out_dim: Output dimension (defaults to in_dim if None).
-        fast_gelu: Use gelu_fast_approx (faster but less precise).
-                   Set to False for MASt3R encoder to maintain PyTorch correlation.
+        fast_gelu: Use gelu_fast_approx (faster) or exact gelu (PyTorch-compatible).
+                   Set to False for decoder to maintain PyTorch correlation.
     """
 
     def __init__(
@@ -31,7 +31,8 @@ class MLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, out_dim or in_dim)
-        self._gelu = nn.gelu_fast_approx if fast_gelu else nn.gelu_approx
+        # fast_gelu=True: fast approximation, fast_gelu=False: exact (PyTorch-compatible)
+        self._gelu = nn.gelu_fast_approx if fast_gelu else nn.gelu
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.fc2(self._gelu(self.fc1(x)))
