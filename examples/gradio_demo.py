@@ -472,7 +472,9 @@ def run_multiview_reconstruction(
     print(f"Loading {len(files)} images...")
     imgs_data = []
     imgs_np = []  # For retrieval
-    for idx, filepath in enumerate(files):
+    for idx, file_input in enumerate(files):
+        # Handle both Gradio 6.x FileData objects and plain paths
+        filepath = file_input.name if hasattr(file_input, 'name') else str(file_input)
         img = load_image(filepath, resolution=resolution, **params)
         imgs_np.append(img)
         imgs_data.append(
@@ -525,11 +527,14 @@ def run_multiview_reconstruction(
         pairs = make_pairs(imgs_data, scene_graph=scene_graph, symmetrize=True)
         print(f"Generated {len(pairs)} pairs")
 
+    # Convert files to paths for sparse_global_alignment
+    file_paths = [f.name if hasattr(f, 'name') else str(f) for f in files]
+
     # Run sparse global alignment
     t0 = time.perf_counter()
     try:
         result = sparse_global_alignment(
-            imgs=[f for f in files],
+            imgs=file_paths,
             pairs_in=pairs,
             cache_path=cache_dir,
             model=model,
