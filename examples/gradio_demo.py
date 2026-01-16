@@ -184,7 +184,7 @@ def extract_features(
 # =============================================================================
 def depth_to_colormap(depth: np.ndarray) -> np.ndarray:
     """Convert depth map to turbo colormap with enhanced contrast."""
-    import matplotlib.cm as cm
+    import matplotlib
 
     d = depth.copy().astype(np.float32)
     valid = np.isfinite(d) & (d > 0.1)
@@ -204,7 +204,7 @@ def depth_to_colormap(depth: np.ndarray) -> np.ndarray:
     bin_indices = np.clip(np.digitize(d_log[valid], bin_edges[:-1]) - 1, 0, len(cdf_normalized) - 1)
     d_norm[valid] = cdf_normalized[bin_indices]
 
-    cmap = cm.get_cmap("turbo")
+    cmap = matplotlib.colormaps.get_cmap("turbo")
     rgb = cmap(d_norm)[:, :, :3]
     rgb[~valid] = 0
 
