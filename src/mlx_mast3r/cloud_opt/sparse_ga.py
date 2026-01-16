@@ -1124,20 +1124,29 @@ def sparse_scene_optimizer(
     def fetch_img(im: str) -> np.ndarray:
         for img1, img2 in pairs_in:
             if img1["instance"] == im:
-                img_tensor = np.array(img1["img"])
-                # Convert from CHW to HWC, denormalize
+                img_tensor = np.array(img1["img"]).astype(np.float32)
+                # Convert from CHW to HWC
                 if img_tensor.ndim == 4:
                     img_tensor = img_tensor[0]
                 if img_tensor.shape[0] == 3:
                     img_tensor = img_tensor.transpose(1, 2, 0)
-                return np.clip(img_tensor * 0.5 + 0.5, 0, 1)
+                # Denormalize based on value range
+                if img_tensor.max() > 1.0:
+                    # uint8 [0-255] -> [0-1]
+                    return np.clip(img_tensor / 255.0, 0, 1)
+                else:
+                    # normalized [-1, 1] -> [0-1]
+                    return np.clip(img_tensor * 0.5 + 0.5, 0, 1)
             if img2["instance"] == im:
-                img_tensor = np.array(img2["img"])
+                img_tensor = np.array(img2["img"]).astype(np.float32)
                 if img_tensor.ndim == 4:
                     img_tensor = img_tensor[0]
                 if img_tensor.shape[0] == 3:
                     img_tensor = img_tensor.transpose(1, 2, 0)
-                return np.clip(img_tensor * 0.5 + 0.5, 0, 1)
+                if img_tensor.max() > 1.0:
+                    return np.clip(img_tensor / 255.0, 0, 1)
+                else:
+                    return np.clip(img_tensor * 0.5 + 0.5, 0, 1)
         return np.zeros((64, 64, 3))
 
     for img_path in imgs:
