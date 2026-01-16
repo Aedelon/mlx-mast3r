@@ -350,9 +350,9 @@ def load_local_features(
         src = f"{prefix}downstream_head{head_idx}.head_local_features"
         dst = f"head_local_features{head_idx}"
 
-        # fc1 -> layers.0, fc2 -> layers.2
+        # fc1 -> fc1, fc2 -> fc2 (MLP class uses fc1/fc2 directly)
         if f"{src}.fc1.weight" in keys:
-            weights[f"{dst}.layers.0.weight"] = mx.array(f.get_tensor(f"{src}.fc1.weight"))
-            weights[f"{dst}.layers.0.bias"] = mx.array(f.get_tensor(f"{src}.fc1.bias"))
-            weights[f"{dst}.layers.2.weight"] = mx.array(f.get_tensor(f"{src}.fc2.weight"))
-            weights[f"{dst}.layers.2.bias"] = mx.array(f.get_tensor(f"{src}.fc2.bias"))
+            weights[f"{dst}.fc1.weight"] = mx.array(f.get_tensor(f"{src}.fc1.weight"))
+            weights[f"{dst}.fc1.bias"] = mx.array(f.get_tensor(f"{src}.fc1.bias"))
+            weights[f"{dst}.fc2.weight"] = mx.array(f.get_tensor(f"{src}.fc2.weight"))
+            weights[f"{dst}.fc2.bias"] = mx.array(f.get_tensor(f"{src}.fc2.bias"))

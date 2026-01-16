@@ -15,7 +15,7 @@ from .scene import Scene
 # New optimization modules
 from .losses import gamma_loss, l1_loss, l2_loss, reprojection_loss
 from .schedules import LRScheduler, cosine_schedule, linear_schedule
-from .optimizer import OptimConfig, SceneOptimizer, optimize_scene
+from .optimizer import OptimConfig, SceneOptimizer, make_pts3d_from_depth, optimize_scene
 from .sparse_ga import SparseGAResult, sparse_global_alignment
 from .tsdf import TSDFPostProcess, apply_tsdf_cleaning, clean_pointcloud
 
@@ -42,6 +42,7 @@ __all__ = [
     # Optimization
     "OptimConfig",
     "SceneOptimizer",
+    "make_pts3d_from_depth",
     "optimize_scene",
     # Sparse GA
     "SparseGAResult",

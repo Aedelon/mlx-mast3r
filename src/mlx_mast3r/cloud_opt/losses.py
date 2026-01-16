@@ -96,24 +96,34 @@ def gamma_loss(gamma: float) -> Callable:
     ) -> mx.array:
         """Compute gamma loss between x and y.
 
+        Matches PyTorch MASt3R pix_loss behavior:
+        - Returns per-point loss if weight is None (for external weighting)
+        - Returns weighted mean if weight is provided
+
         Args:
-            x: Predicted values
-            y: Target values
-            weight: Optional per-element weights
+            x: Predicted values [N, D]
+            y: Target values [N, D]
+            weight: Optional per-element weights [N]
+                   If None, returns per-point losses [N]
+                   If provided, returns weighted mean (scalar)
 
         Returns:
-            Scalar loss value
+            Per-point losses [N] if weight is None, else scalar
         """
-        # L1 distance
-        l1 = mx.sqrt(mx.sum((x - y) ** 2, axis=-1) + 1e-8)
+        # L2 distance per point
+        l2 = mx.sqrt(mx.sum((x - y) ** 2, axis=-1) + 1e-8)
 
         # Apply gamma transformation
-        loss = (l1 + offset) ** gamma - offset**gamma
+        loss = (l2 + offset) ** gamma - offset**gamma
 
         if weight is not None:
+            # Weighted mean (original behavior)
             loss = loss * weight.reshape(loss.shape)
-
-        return loss.mean()
+            return loss.mean()
+        else:
+            # Return per-point losses for external weighting
+            # (Matches PyTorch pix_loss behavior)
+            return loss
 
     return loss_fn
 

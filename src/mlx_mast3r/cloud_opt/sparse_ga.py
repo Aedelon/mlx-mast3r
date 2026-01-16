@@ -19,8 +19,88 @@ from scipy.sparse.csgraph import minimum_spanning_tree
 
 from .geometry import depthmap_to_pts3d, geotrf, inv
 from .losses import gamma_loss
-from .optimizer import OptimConfig, SceneOptimizer, optimize_scene
+from .optimizer import (
+    OptimConfig,
+    SceneOptimizer,
+    build_mst_from_correspondences,
+    make_pts3d_from_depth,
+    optimize_scene,
+)
 from .schedules import cosine_schedule
+
+
+def anchor_depth_offsets(
+    canon_depth: mx.array,
+    pixels: dict[str, tuple[mx.array, mx.array, mx.array]],
+    subsample: int = 8,
+) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
+    """Compute depth offsets for anchor points.
+
+    Matches PyTorch MASt3R anchor_depth_offsets function.
+    For each correspondence pixel, computes:
+    - The index into the subsampled core depth
+    - The ratio offset = pixel_depth / core_depth
+
+    Args:
+        canon_depth: Full canonical depth map [H, W]
+        pixels: Dict mapping img2 -> (pts1, pts2, conf) for correspondences
+        subsample: Subsampling factor
+
+    Returns:
+        Tuple of (core_idxs, core_offs) dicts, both keyed by img2
+    """
+    H1, W1 = canon_depth.shape
+    H_sub = (H1 + subsample - 1) // subsample
+    W_sub = (W1 + subsample - 1) // subsample
+
+    # Get subsampled depth at anchor centers
+    # PyTorch: yx = np.mgrid[subsample//2:H1:subsample, subsample//2:W1:subsample]
+    # cy, cx = yx.reshape(2, -1)
+    # core_depth = canon_depth[cy, cx]
+    core_depth_sub = canon_depth[subsample // 2 :: subsample, subsample // 2 :: subsample]
+    core_depth_flat = core_depth_sub.reshape(-1)
+
+    # Ensure positive depth
+    core_depth_flat = mx.maximum(core_depth_flat, mx.array(1e-6))
+
+    core_idxs = {}
+    core_offs = {}
+
+    for img2, pixel_data in pixels.items():
+        # Unpack (pts1, pts2, conf) or (pts1, conf)
+        if len(pixel_data) == 3:
+            xy1, xy2, confs = pixel_data
+        else:
+            xy1, confs = pixel_data
+            xy2 = xy1
+
+        # Get pixel coordinates as integers
+        px = xy1[:, 0].astype(mx.int32)
+        py = xy1[:, 1].astype(mx.int32)
+
+        # Clip to valid range
+        px = mx.clip(px, 0, W1 - 1)
+        py = mx.clip(py, 0, H1 - 1)
+
+        # Find nearest anchor (block quantization)
+        # core_idx = (py // subsample) * W_sub + (px // subsample)
+        core_idx = (py // subsample) * W_sub + (px // subsample)
+        core_idx = mx.clip(core_idx, 0, H_sub * W_sub - 1)
+
+        # Get reference depth at anchor
+        ref_z = core_depth_flat[core_idx]
+
+        # Get actual depth at pixel
+        # Need to sample from full depth map
+        pts_z = canon_depth[py, px]
+
+        # Compute offset ratio
+        offset = pts_z / (ref_z + 1e-8)
+
+        core_idxs[img2] = core_idx
+        core_offs[img2] = offset
+
+    return core_idxs, core_offs
 
 
 @dataclass
@@ -31,15 +111,14 @@ class SparseGAResult:
     img_paths: list[str]
     focals: mx.array  # [N] optimized focals
     principal_points: mx.array  # [N, 2]
-    cam2w: mx.array  # [N, 4, 4] camera-to-world
-    depthmaps: list[mx.array]  # [H, W] per image (scaled by optimizer - use original_depthmaps for reconstruction)
+    cam2w: mx.array  # [N, 4, 4] camera-to-world (with global scaling applied)
+    depthmaps: list[mx.array]  # [H, W] per image (with global scaling applied)
     pts3d: list[mx.array]  # Sparse 3D points per image
     pts3d_colors: list[np.ndarray]  # Colors for 3D points
     confs: list[mx.array]  # Confidence maps per image
     canonical_paths: list[str] | None  # Cache paths
-    base_focals: mx.array | None = None  # [N] initial focal estimates from canonical views
-    original_depthmaps: list[mx.array] | None = None  # Original unscaled depthmaps from canonical views
-    depth_scales: mx.array | None = None  # [N] depth scaling factors from optimization
+    base_focals: mx.array | None = None  # [N] initial focal estimates
+    sizes: mx.array | None = None  # [N] optimized scale factors per view
 
     @property
     def n_imgs(self) -> int:
@@ -73,9 +152,8 @@ class SparseGAResult:
     ) -> tuple[list[mx.array], list[mx.array], list[mx.array]]:
         """Get dense 3D points from depthmaps.
 
-        Uses the original unscaled depthmaps (from canonical views) combined
-        with optimized camera poses. The camera poses were optimized for scaled
-        points, so we need to adjust the translations.
+        The optimizer already applies global_scaling to both poses and depths,
+        ensuring consistent scale between translations and depth values.
 
         Args:
             clean_depth: Apply depth cleaning
@@ -87,20 +165,12 @@ class SparseGAResult:
         pts3d_list = []
         depth_list = []
 
-        # Use original unscaled depthmaps if available, otherwise fall back to scaled
-        depthmaps_to_use = self.original_depthmaps if self.original_depthmaps else self.depthmaps
-
         for i in range(self.n_imgs):
-            H, W = depthmaps_to_use[i].shape
-            depth = depthmaps_to_use[i]
+            H, W = self.depthmaps[i].shape
+            depth = self.depthmaps[i]
 
-            # Use base_focals for unprojection since depths are in canonical space
-            # If base_focals not available, fall back to optimized focals
-            if self.base_focals is not None:
-                f = self.base_focals[i]
-            else:
-                f = self.focals[i]
-
+            # Use optimized focals for unprojection
+            f = self.focals[i]
             pp = self.principal_points[i]
             K = mx.array(
                 [
@@ -110,25 +180,13 @@ class SparseGAResult:
                 ]
             )
 
-            # Unproject to 3D using canonical focal
+            # Unproject to 3D
             pts3d = depthmap_to_pts3d(depth, K)
 
-            # Get pose and adjust translation for unscaled points
-            # The poses were optimized for pts3d * scale, so translations need to be
-            # divided by scale to work with unscaled pts3d
-            cam2w = self.cam2w[i].copy() if hasattr(self.cam2w[i], 'copy') else mx.array(self.cam2w[i])
+            # Transform to world coordinates using optimized poses
+            # Poses already have global_scaling applied to translations
+            cam2w = self.cam2w[i]
 
-            if self.depth_scales is not None:
-                scale = self.depth_scales[i]
-                # Adjust translation: t_corrected = t / scale
-                cam2w = mx.array([
-                    [cam2w[0, 0], cam2w[0, 1], cam2w[0, 2], cam2w[0, 3] / scale],
-                    [cam2w[1, 0], cam2w[1, 1], cam2w[1, 2], cam2w[1, 3] / scale],
-                    [cam2w[2, 0], cam2w[2, 1], cam2w[2, 2], cam2w[2, 3] / scale],
-                    [cam2w[3, 0], cam2w[3, 1], cam2w[3, 2], cam2w[3, 3]],
-                ])
-
-            # Transform to world coordinates
             pts3d_world = geotrf(cam2w, pts3d.reshape(-1, 3)).reshape(H, W, 3)
 
             pts3d_list.append(pts3d_world)
@@ -222,6 +280,7 @@ def sparse_global_alignment(
         core_depth,
         img_confs,
         anchors,
+        anchor_data,  # NEW: anchor data for make_pts3d_from_depth
         corres,
         corres2d,
     ) = condense_data(
@@ -248,6 +307,7 @@ def sparse_global_alignment(
         core_depth=core_depth,
         img_confs=img_confs,
         anchors=anchors,
+        anchor_data=anchor_data,  # NEW: pass anchor data
         corres=corres,
         mst=mst,
         canonical_paths=canonical_paths,
@@ -701,8 +761,13 @@ def prepare_canonical_data(
         if focal is None:
             focal = estimate_focal_from_depth(canon, pp)
 
-        # Extract core depth
+        # Extract core depth from canonical view
         core_depth = canon[subsample // 2 :: subsample, subsample // 2 :: subsample, 2]
+
+        # Compute anchor depth offsets for precise 3D reconstruction
+        # (Matches PyTorch MASt3R anchor_depth_offsets)
+        canon_depth_full = canon[..., 2]  # Full depth map [H, W]
+        idxs, offsets = anchor_depth_offsets(canon_depth_full, pixels, subsample=subsample)
 
         # Ensure cconf is defined
         if "cconf" not in locals() or cconf is None:
@@ -714,6 +779,8 @@ def prepare_canonical_data(
             "focal": focal,
             "core_depth": core_depth,
             "pixels": pixels,
+            "anchor_idxs": idxs,  # NEW: indices into subsampled depth
+            "anchor_offs": offsets,  # NEW: depth offset ratios
             "conf": cconf,
         }
 
@@ -822,7 +889,7 @@ def condense_data(
         preds_21: Cross-predictions
 
     Returns:
-        Tuple of condensed data
+        Tuple of condensed data including anchor_data for 3D reconstruction
     """
     n_imgs = len(imgs)
 
@@ -832,6 +899,7 @@ def condense_data(
     core_depth = []
     confs = []  # Confidence maps for each image
     anchors = {}
+    anchor_data = {}  # NEW: For make_pts3d_from_depth (pixels, idxs, offsets)
     corres = []
     corres2d = []
 
@@ -845,9 +913,15 @@ def condense_data(
         core_depth.append(cv["core_depth"])
         confs.append(cv.get("conf", mx.ones((H, W))))
 
+        # Get anchor offsets computed in prepare_canonical_data
+        anchor_idxs = cv.get("anchor_idxs", {})
+        anchor_offs = cv.get("anchor_offs", {})
+
         # Build anchor data
         pixels_data = cv["pixels"]
         all_pixels = []
+        all_idxs = []
+        all_offs = []
         all_confs = []
 
         for other_img, pixel_data in pixels_data.items():
@@ -860,6 +934,11 @@ def condense_data(
 
             all_pixels.append(pixels)
             all_confs.append(conf)
+
+            # Get anchor indices and offsets for this pair
+            if other_img in anchor_idxs:
+                all_idxs.append(anchor_idxs[other_img])
+                all_offs.append(anchor_offs[other_img])
 
             # Build correspondence entry with both pts1 and pts2
             other_idx = imgs.index(other_img)
@@ -880,6 +959,13 @@ def condense_data(
             all_pixels = mx.zeros((0, 2))
             all_confs = mx.zeros(0)
 
+        # Build anchor_data for make_pts3d_from_depth
+        # Format: (pixels, idxs, offsets)
+        if all_idxs and all_offs:
+            all_idxs_cat = mx.concatenate(all_idxs, axis=0)
+            all_offs_cat = mx.concatenate(all_offs, axis=0)
+            anchor_data[idx] = (all_pixels, all_idxs_cat, all_offs_cat)
+
         anchors[idx] = {
             "pixels": all_pixels,
             "confs": all_confs,
@@ -892,6 +978,7 @@ def condense_data(
         core_depth,
         confs,
         anchors,
+        anchor_data,  # NEW: Added anchor_data
         corres,
         corres2d,
     )
@@ -965,6 +1052,7 @@ def sparse_scene_optimizer(
     core_depth: list[mx.array],
     img_confs: list[mx.array],
     anchors: dict,
+    anchor_data: dict,  # NEW: anchor data for make_pts3d_from_depth
     corres: list[dict],
     mst: tuple[int, list[tuple[int, int]]],
     canonical_paths: list[str] | None,
@@ -992,6 +1080,7 @@ def sparse_scene_optimizer(
         core_depth: Subsampled depth maps
         img_confs: Confidence maps per image
         anchors: Anchor point data
+        anchor_data: Dict of (pixels, idxs, offsets) per image for make_pts3d
         corres: Correspondences
         mst: Kinematic chain (root, edges)
         canonical_paths: Cache paths
@@ -1025,7 +1114,14 @@ def sparse_scene_optimizer(
             d = d[:expected_size]
         init_depths.append(d.reshape(H_sub, W_sub))
 
-    # Create optimizer
+    # Build MST from correspondences for kinematic chain
+    # Use input corres (already available) to build the MST
+    mst_parent_map, mst_root = build_mst_from_correspondences(corres, n_imgs)
+
+    if verbose:
+        print(f"Built MST with root={mst_root}, edges={len(mst_parent_map)}")
+
+    # Create optimizer with MST
     optimizer = SceneOptimizer(
         n_images=n_imgs,
         image_sizes=imsizes,
@@ -1034,6 +1130,7 @@ def sparse_scene_optimizer(
         init_depths=init_depths,
         subsample=subsample,
         shared_intrinsics=shared_intrinsics,
+        mst_edges=mst_parent_map,
     )
 
     # Build canonical 3D points from depths
@@ -1110,16 +1207,6 @@ def sparse_scene_optimizer(
         shared_intrinsics=shared_intrinsics,
     )
 
-    # Store original unscaled depths for later reconstruction
-    original_depthmaps = []
-    for i in range(n_imgs):
-        H, W = imsizes[i]
-        d_sub = init_depths[i]  # These are the unscaled depths
-        # Upsample to full resolution (nearest neighbor)
-        d_full = mx.repeat(mx.repeat(d_sub, subsample, axis=0), subsample, axis=1)
-        d_full = d_full[:H, :W]
-        original_depthmaps.append(d_full)
-
     # Run optimization
     if verbose:
         print("Running scene optimization...")
@@ -1129,15 +1216,16 @@ def sparse_scene_optimizer(
         corres=opt_corres,
         canonical_pts3d=canonical_pts3d,
         config=config,
+        anchor_data=anchor_data,  # Pass anchor data for precise 3D reconstruction
         verbose=verbose,
     )
 
-    # Extract results
+    # Extract results - poses and depths already have global_scaling applied
     poses = optimizer.get_poses()
     focals = optimizer.get_focals()
     pps_out = optimizer.get_principal_points()
     depths = optimizer.get_depths()
-    depth_scales = mx.exp(optimizer.log_scales)  # Scaling factors for translation compensation
+    sizes = optimizer.sizes  # Optimized scale factors per view
 
     # Compute final 3D points
     pts3d_list = []
@@ -1216,7 +1304,6 @@ def sparse_scene_optimizer(
         pts3d_colors=pts3d_colors,
         confs=confs_list,
         canonical_paths=canonical_paths,
-        base_focals=init_focals,  # Original focals from canonical views for depth compensation
-        original_depthmaps=original_depthmaps,  # Unscaled depths for correct pts3d reconstruction
-        depth_scales=depth_scales,  # Scaling factors for translation compensation
+        base_focals=init_focals,
+        sizes=sizes,
     )
