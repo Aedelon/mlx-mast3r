@@ -83,6 +83,64 @@ _ROPE2D_KERNEL_VEC2 = """
     k_out[idx2] = k2 * cos_val2 + k1 * sin_val2;
 """
 
+# Single tensor RoPE kernel (for separate Q and K with different positions)
+_ROPE2D_KERNEL_SINGLE = """
+    uint tid = thread_position_in_grid.x;
+
+    // Dimensions from shape
+    uint B = x_shape[0];
+    uint H = x_shape[1];      // num_heads
+    uint N = x_shape[2];      // sequence length
+    uint D = x_shape[3];      // head_dim
+    uint D_half = D / 2;      // half of head_dim (y-half or x-half)
+    uint D_quarter = D_half / 2;  // quarter for rotate_half pairs
+
+    // Total work items: each thread handles 2 elements (a pair)
+    uint total_pairs = B * H * N * D_half;
+    if (tid >= total_pairs) return;
+
+    // Decode indices for pairs: [b, h, n, pair_idx]
+    uint pair_idx = tid % D_half;
+    uint n = (tid / D_half) % N;
+    uint h = (tid / (D_half * N)) % H;
+    uint b = tid / (D_half * N * H);
+
+    // Get position for this token
+    int pos_y = static_cast<int>(positions[n * 2]);
+    int pos_x = static_cast<int>(positions[n * 2 + 1]);
+
+    // Determine if we're in y-half or x-half
+    bool is_x_half = (pair_idx >= D_quarter);
+    uint d_local = is_x_half ? (pair_idx - D_quarter) : pair_idx;
+    int pos = (pair_idx < D_quarter) ? pos_y : pos_x;
+
+    // The two dimensions this thread handles
+    uint base_d = is_x_half ? D_half : 0;
+    uint d1 = base_d + d_local;
+    uint d2 = base_d + d_local + D_quarter;
+
+    // Compute indices into x tensor
+    uint base_idx = b * (H * N * D) + h * (N * D) + n * D;
+    uint idx1 = base_idx + d1;
+    uint idx2 = base_idx + d2;
+
+    // Load cos/sin
+    uint cos_sin_idx = pos * D_half + d_local;
+    T cos_val = cos_table[cos_sin_idx];
+    T sin_val = sin_table[cos_sin_idx];
+
+    uint cos_sin_idx2 = pos * D_half + d_local + D_quarter;
+    T cos_val2 = cos_table[cos_sin_idx2];
+    T sin_val2 = sin_table[cos_sin_idx2];
+
+    // Load values
+    T x1 = x[idx1], x2 = x[idx2];
+
+    // Apply RoPE with rotate_half
+    x_out[idx1] = x1 * cos_val - x2 * sin_val;
+    x_out[idx2] = x2 * cos_val2 + x1 * sin_val2;
+"""
+
 # Scalar fallback kernel (1 element per thread)
 _ROPE2D_KERNEL_SCALAR = """
     uint tid = thread_position_in_grid.x;
@@ -140,6 +198,7 @@ _ROPE2D_KERNEL_SCALAR = """
 # Kernel instances (lazy initialization)
 _rope2d_kernel_vec2 = None
 _rope2d_kernel_scalar = None
+_rope2d_kernel_single = None
 
 
 def _get_rope2d_kernel(vectorized: bool = True):
@@ -223,6 +282,77 @@ def apply_rope_2d_fused(
     )
 
     return outputs[0], outputs[1]
+
+
+def _get_rope2d_kernel_single():
+    """Get or create the single-tensor RoPE 2D kernel."""
+    global _rope2d_kernel_single
+
+    if _rope2d_kernel_single is None:
+        _rope2d_kernel_single = mx.fast.metal_kernel(
+            name="rope2d_fused_single",
+            input_names=["x", "cos_table", "sin_table", "positions"],
+            output_names=["x_out"],
+            source=_ROPE2D_KERNEL_SINGLE,
+            header="",
+            ensure_row_contiguous=True,
+        )
+    return _rope2d_kernel_single
+
+
+def apply_rope_2d_single(
+    x: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    positions: mx.array,
+) -> mx.array:
+    """Apply 2D RoPE to a single tensor using fused Metal kernel.
+
+    This is useful when Q and K need different position encodings
+    (e.g., for cross-attention between views with different shapes).
+
+    Args:
+        x: [B, nheads, N, head_dim] tensor to rotate
+        cos, sin: [max_pos, head_dim // 2] precomputed tables
+        positions: [N, 2] position indices (y, x) for each token
+
+    Returns:
+        x_rotated with same shape as input
+    """
+    # Ensure positions is int32 for indexing
+    if positions.dtype != mx.int32:
+        positions = positions.astype(mx.int32)
+
+    # Get dimensions
+    B, H, N, D = x.shape
+    D_half = D // 2
+
+    # Get kernel
+    kernel = _get_rope2d_kernel_single()
+    total_pairs = B * H * N * D_half
+
+    # Grid and threadgroup sizes
+    threads_per_group = 256
+
+    # Determine template type
+    if x.dtype == mx.float16:
+        template_type = ("T", mx.float16)
+    elif x.dtype == mx.bfloat16:
+        template_type = ("T", mx.bfloat16)
+    else:
+        template_type = ("T", mx.float32)
+
+    # Run kernel
+    outputs = kernel(
+        inputs=[x, cos, sin, positions],
+        template=[template_type],
+        grid=(total_pairs, 1, 1),
+        threadgroup=(threads_per_group, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+    )
+
+    return outputs[0]
 
 
 # Benchmark helper

@@ -194,16 +194,30 @@ class DecoderCrossAttention(nn.Module):
         self.kv = nn.Linear(dim, 2 * dim)
         self.proj = nn.Linear(dim, dim)
 
-        # RoPE tables for cross-attention
+        # RoPE tables (shared cos/sin, separate positions for Q and K)
         self._rope_cos: mx.array | None = None
         self._rope_sin: mx.array | None = None
-        self._rope_positions: mx.array | None = None
+        self._rope_positions_q: mx.array | None = None
+        self._rope_positions_k: mx.array | None = None
 
-    def set_rope_tables(self, cos: mx.array, sin: mx.array, positions: mx.array) -> None:
-        """Set precomputed RoPE tables and positions."""
+    def set_rope_tables(
+        self,
+        cos: mx.array,
+        sin: mx.array,
+        positions_q: mx.array,
+        positions_k: mx.array | None = None,
+    ) -> None:
+        """Set precomputed RoPE tables and positions.
+
+        Args:
+            cos, sin: Precomputed cos/sin tables
+            positions_q: Positions for query tokens [N_q, 2]
+            positions_k: Positions for key tokens [N_k, 2], defaults to positions_q
+        """
         self._rope_cos = cos
         self._rope_sin = sin
-        self._rope_positions = positions
+        self._rope_positions_q = positions_q
+        self._rope_positions_k = positions_k if positions_k is not None else positions_q
 
     def __call__(self, x: mx.array, context: mx.array) -> mx.array:
         B, N, D = x.shape
@@ -212,9 +226,11 @@ class DecoderCrossAttention(nn.Module):
         kv = self.kv(context).reshape(B, -1, 2, self.num_heads, self.head_dim)
         k, v = kv[:, :, 0].transpose(0, 2, 1, 3), kv[:, :, 1].transpose(0, 2, 1, 3)
 
-        # Apply RoPE to Q and K (same positions for both views with same resolution)
+        # Apply RoPE to Q and K with separate positions for each view
         if self.use_rope and self._rope_cos is not None:
-            q, k = apply_rope_2d(q, k, self._rope_cos, self._rope_sin, self._rope_positions)
+            from mlx_mast3r.kernels.rope2d import apply_rope_2d_single
+            q = apply_rope_2d_single(q, self._rope_cos, self._rope_sin, self._rope_positions_q)
+            k = apply_rope_2d_single(k, self._rope_cos, self._rope_sin, self._rope_positions_k)
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         return self.proj(out.transpose(0, 2, 1, 3).reshape(B, N, D))
@@ -254,10 +270,24 @@ class DecoderBlock(nn.Module):
         # Use exact GELU (not fast approx) to match PyTorch decoder
         self.mlp = MLP(config.decoder_dim, config.mlp_dim, fast_gelu=False)
 
-    def set_rope_tables(self, cos: mx.array, sin: mx.array, positions: mx.array) -> None:
-        """Propagate RoPE tables to self-attention and cross-attention."""
-        self.self_attn.set_rope_tables(cos, sin, positions)
-        self.cross_attn.set_rope_tables(cos, sin, positions)
+    def set_rope_tables(
+        self,
+        cos: mx.array,
+        sin: mx.array,
+        positions_self: mx.array,
+        positions_cross_q: mx.array,
+        positions_cross_k: mx.array,
+    ) -> None:
+        """Propagate RoPE tables to self-attention and cross-attention.
+
+        Args:
+            cos, sin: Shared cos/sin tables
+            positions_self: Positions for self-attention (same as Q)
+            positions_cross_q: Positions for cross-attention query
+            positions_cross_k: Positions for cross-attention key (may differ from Q)
+        """
+        self.self_attn.set_rope_tables(cos, sin, positions_self)
+        self.cross_attn.set_rope_tables(cos, sin, positions_cross_q, positions_cross_k)
 
     def __call__(self, x: mx.array, context: mx.array) -> mx.array:
         # Self-attention
@@ -627,25 +657,61 @@ class Mast3rDecoder(nn.Module):
         self.head_local_features1 = MLP(idim, idim * 4, out_dim, fast_gelu=False)
         self.head_local_features2 = MLP(idim, idim * 4, out_dim, fast_gelu=False)
 
-        # RoPE tables
+        # RoPE tables (shared cos/sin, separate positions per view)
         self._rope_cos: mx.array | None = None
         self._rope_sin: mx.array | None = None
-        self._rope_positions: mx.array | None = None
+        self._rope_positions1: mx.array | None = None
+        self._rope_positions2: mx.array | None = None
+        self._last_shapes: tuple[tuple[int, int], tuple[int, int]] | None = None
 
-    def _init_rope(self, H: int, W: int) -> None:
-        """Initialize RoPE tables for patch grid."""
-        cos, sin, positions = precompute_rope_2d(
-            H, W, self.config.head_dim, theta=100.0, dtype=self.config.dtype
+    def _init_rope(self, shape1: tuple[int, int], shape2: tuple[int, int]) -> None:
+        """Initialize RoPE tables for two patch grids with potentially different shapes.
+
+        Args:
+            shape1: (H1, W1) patch grid shape for view 1
+            shape2: (H2, W2) patch grid shape for view 2
+        """
+        H1, W1 = shape1
+        H2, W2 = shape2
+
+        # Use max dimensions for cos/sin tables (they can handle both views)
+        max_H = max(H1, H2)
+        max_W = max(W1, W2)
+
+        cos, sin, _ = precompute_rope_2d(
+            max_H, max_W, self.config.head_dim, theta=100.0, dtype=self.config.dtype
         )
         self._rope_cos = cos
         self._rope_sin = sin
-        self._rope_positions = positions
+
+        # Compute separate position grids for each view
+        _, _, positions1 = precompute_rope_2d(
+            H1, W1, self.config.head_dim, theta=100.0, dtype=self.config.dtype
+        )
+        _, _, positions2 = precompute_rope_2d(
+            H2, W2, self.config.head_dim, theta=100.0, dtype=self.config.dtype
+        )
+        self._rope_positions1 = positions1
+        self._rope_positions2 = positions2
+        self._last_shapes = (shape1, shape2)
 
         # Propagate to all decoder blocks
+        # dec_blocks: view 1 self-attention, cross-attention Q=view1, K=view2
         for blk in self.dec_blocks:
-            blk.set_rope_tables(cos, sin, positions)
+            blk.set_rope_tables(
+                cos, sin,
+                positions_self=positions1,
+                positions_cross_q=positions1,
+                positions_cross_k=positions2,
+            )
+        # dec_blocks2: view 2 self-attention, cross-attention Q=view2, K=view1
         for blk in self.dec_blocks2:
-            blk.set_rope_tables(cos, sin, positions)
+            blk.set_rope_tables(
+                cos, sin,
+                positions_self=positions2,
+                positions_cross_q=positions2,
+                positions_cross_k=positions1,
+            )
 
     def __call__(
         self,
@@ -669,9 +735,10 @@ class Mast3rDecoder(nn.Module):
         H1, W1 = shape1
         H2, W2 = shape2
 
-        # Initialize RoPE if needed
-        if self._rope_cos is None:
-            self._init_rope(H1, W1)
+        # Initialize RoPE if needed, or reinitialize if shapes changed
+        current_shapes = (shape1, shape2)
+        if self._rope_cos is None or self._last_shapes != current_shapes:
+            self._init_rope(shape1, shape2)
 
         # Encoder outputs are already normalized (enc_norm applied in encoder)
         # Project to decoder dim
@@ -867,15 +934,19 @@ class Mast3rDecoderEngine:
         # Evaluate encoder outputs before decoder (prevents NaN from deep lazy graphs)
         mx.eval(feat1, feat2)
 
-        # Compute patch dimensions from actual image size
-        _, H_img, W_img, _ = img1.shape
+        # Compute patch dimensions from EACH image's actual size
+        # (images can have different aspect ratios)
+        _, H1_img, W1_img, _ = img1.shape
+        _, H2_img, W2_img, _ = img2.shape
         patch_size = self.encoder_config.patch_size
-        H = H_img // patch_size
-        W = W_img // patch_size
+        H1 = H1_img // patch_size
+        W1 = W1_img // patch_size
+        H2 = H2_img // patch_size
+        W2 = W2_img // patch_size
 
         if self._compiled_decoder:
-            return self._compiled_decoder(feat1, feat2, (H, W), (H, W))
-        return self.decoder(feat1, feat2, (H, W), (H, W))
+            return self._compiled_decoder(feat1, feat2, (H1, W1), (H2, W2))
+        return self.decoder(feat1, feat2, (H1, W1), (H2, W2))
 
     def infer(
         self,

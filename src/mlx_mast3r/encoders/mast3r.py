@@ -293,17 +293,23 @@ class Mast3rEncoder(nn.Module):
         self.norm_weight = mx.ones((config.embed_dim,))
         self.norm_bias = mx.zeros((config.embed_dim,))
 
-        # Cached positions grid
-        self._positions: mx.array | None = None
+        # Cached positions grid: {(H, W): positions}
+        self._positions_cache: dict[tuple[int, int], mx.array] = {}
 
     def _get_positions(self, H: int, W: int, B: int) -> mx.array:
-        """Get position grid, caching for efficiency."""
-        if self._positions is None or self._positions.shape[1] != H * W:
-            self._positions = get_positions_grid(H, W)
+        """Get position grid, caching for efficiency.
+
+        Note: The cache key is (H, W) not just H*W, because portrait (32x24)
+        and landscape (24x32) have the same number of patches but different grids!
+        """
+        cache_key = (H, W)
+        if cache_key not in self._positions_cache:
+            self._positions_cache[cache_key] = get_positions_grid(H, W)
+        positions = self._positions_cache[cache_key]
         # Expand for batch: [1, H*W, 2] -> [B, H*W, 2]
         if B > 1:
-            return mx.broadcast_to(self._positions, (B, H * W, 2))
-        return self._positions
+            return mx.broadcast_to(positions, (B, H * W, 2))
+        return positions
 
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass.
