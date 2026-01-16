@@ -97,6 +97,20 @@ def get_model_params(model_name: str) -> dict:
         return {"square_ok": False, "patch_size": 16}
 
 
+def get_default_conf_threshold(model_name: str) -> float:
+    """Get recommended confidence threshold for model.
+
+    DuneMASt3R produces higher confidence scores than MASt3R Full,
+    so we use different default thresholds for optimal visualization.
+    """
+    if "MASt3R Full" in model_name:
+        return 1.0  # MASt3R Full has lower confidence scores
+    elif "DuneMASt3R" in model_name:
+        return 1.5  # DuneMASt3R has higher confidence scores
+    else:
+        return 0.5  # DUNE features only, low threshold
+
+
 # =============================================================================
 # Feature extraction (DUNE)
 # =============================================================================
@@ -937,7 +951,7 @@ def create_demo():
                     with gr.Row():
                         recon_min_conf = gr.Slider(
                             label="Seuil confiance",
-                            value=0.5,  # Lower default for DuneMASt3R compatibility
+                            value=1.0,  # Adaptatif selon modèle (1.0 pour MASt3R Full, 1.5 pour DuneMASt3R)
                             minimum=0.0,
                             maximum=10.0,
                             step=0.1,
@@ -989,6 +1003,13 @@ def create_demo():
                         recon_cam_size,
                     ],
                     outputs=[recon_model3d, recon_gallery, recon_status, recon_download],
+                )
+
+                # Update confidence threshold when model changes
+                recon_model.change(
+                    fn=get_default_conf_threshold,
+                    inputs=[recon_model],
+                    outputs=[recon_min_conf],
                 )
 
             # =================================================================
@@ -1117,7 +1138,7 @@ def create_demo():
                     with gr.Row():
                         mv_min_conf = gr.Slider(
                             label="Seuil confiance",
-                            value=0.5,  # Lower default for DuneMASt3R compatibility
+                            value=1.0,  # Adaptatif selon modèle (1.0 pour MASt3R Full, 1.5 pour DuneMASt3R)
                             minimum=0.0,
                             maximum=20.0,
                             step=0.5,
@@ -1183,6 +1204,13 @@ def create_demo():
                     fn=update_sg_visibility,
                     inputs=[mv_scenegraph],
                     outputs=[mv_winsize, mv_refid, mv_cyclic, mv_retrieval_na, mv_retrieval_k],
+                )
+
+                # Update confidence threshold when model changes
+                mv_model.change(
+                    fn=get_default_conf_threshold,
+                    inputs=[mv_model],
+                    outputs=[mv_min_conf],
                 )
 
                 # Main reconstruction button
