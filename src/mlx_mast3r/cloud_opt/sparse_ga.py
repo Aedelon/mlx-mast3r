@@ -15,7 +15,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from scipy.sparse.csgraph import minimum_spanning_tree
 
 from .geometry import depthmap_to_pts3d, geotrf, inv
 from .losses import gamma_loss
@@ -290,13 +289,8 @@ def sparse_global_alignment(
         preds_21,
     )
 
-    # Build kinematic chain using hierarchical clustering
-    mst = build_kinematic_chain(pairwise_scores, imsizes, subsample)
-
-    if verbose:
-        print(f"Built kinematic chain with root node {mst[0]}")
-
     # Run optimization
+    # Note: MST is built inside sparse_scene_optimizer from correspondences
     result = sparse_scene_optimizer(
         imgs=imgs,
         pairs_in=pairs_in,
@@ -307,9 +301,8 @@ def sparse_global_alignment(
         core_depth=core_depth,
         img_confs=img_confs,
         anchors=anchors,
-        anchor_data=anchor_data,  # NEW: pass anchor data
+        anchor_data=anchor_data,
         corres=corres,
-        mst=mst,
         canonical_paths=canonical_paths,
         lr1=lr1,
         niter1=niter1,
@@ -984,64 +977,6 @@ def condense_data(
     )
 
 
-def build_kinematic_chain(
-    pairwise_scores: np.ndarray,
-    imsizes: list[tuple[int, int]],
-    subsample: int = 8,
-) -> tuple[int, list[tuple[int, int]]]:
-    """Build kinematic chain using hierarchical clustering.
-
-    Args:
-        pairwise_scores: NxN similarity matrix
-        imsizes: Image sizes for normalization
-        subsample: Subsampling factor
-
-    Returns:
-        Tuple of (root_node, edge_list)
-    """
-    n = len(pairwise_scores)
-
-    if n <= 1:
-        return 0, []
-
-    # Normalize scores
-    n_patches = np.array([h * w // (subsample**2) for h, w in imsizes])
-    max_n_corres = 3 * np.minimum(n_patches[:, None], n_patches[None, :])
-    pws = np.clip(pairwise_scores / (max_n_corres + 1e-8), 0, 1)
-    np.fill_diagonal(pws, 1)
-
-    # Convert to distance matrix
-    distance_matrix = np.where(pws > 0, 1 - pws, 2)
-
-    # Compute MST
-    mst_matrix = minimum_spanning_tree(distance_matrix)
-    mst_edges = np.array(mst_matrix.nonzero()).T
-
-    # Find root (node with highest total similarity)
-    root = np.argmax(pairwise_scores.sum(axis=1))
-
-    # Build edge list from root
-    edges = []
-    visited = {root}
-    queue = [root]
-
-    # BFS to order edges from root
-    adjacency = {i: [] for i in range(n)}
-    for i, j in mst_edges:
-        adjacency[i].append(j)
-        adjacency[j].append(i)
-
-    while queue:
-        node = queue.pop(0)
-        for neighbor in adjacency[node]:
-            if neighbor not in visited:
-                visited.add(neighbor)
-                edges.append((node, neighbor))
-                queue.append(neighbor)
-
-    return root, edges
-
-
 def sparse_scene_optimizer(
     imgs: list[str],
     pairs_in: list[tuple[dict, dict]],
@@ -1052,9 +987,8 @@ def sparse_scene_optimizer(
     core_depth: list[mx.array],
     img_confs: list[mx.array],
     anchors: dict,
-    anchor_data: dict,  # NEW: anchor data for make_pts3d_from_depth
+    anchor_data: dict,
     corres: list[dict],
-    mst: tuple[int, list[tuple[int, int]]],
     canonical_paths: list[str] | None,
     lr1: float = 0.07,
     niter1: int = 300,
@@ -1082,7 +1016,6 @@ def sparse_scene_optimizer(
         anchors: Anchor point data
         anchor_data: Dict of (pixels, idxs, offsets) per image for make_pts3d
         corres: Correspondences
-        mst: Kinematic chain (root, edges)
         canonical_paths: Cache paths
         lr1, niter1: Coarse phase parameters
         lr2, niter2: Fine phase parameters
