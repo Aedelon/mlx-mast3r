@@ -100,10 +100,19 @@ def get_model_params(model_name: str) -> dict:
 # =============================================================================
 # Feature extraction (DUNE)
 # =============================================================================
-def visualize_features_pca(features: np.ndarray, img_shape: tuple[int, int]) -> np.ndarray:
+def visualize_features_pca(features: np.ndarray, img_shape: tuple[int, int], patch_size: int = 14) -> np.ndarray:
     """Visualize features using PCA projection to RGB."""
     n_patches = features.shape[0]
-    patch_size = int(np.sqrt(n_patches))
+
+    # Calculate patch grid dimensions from image shape
+    H, W = img_shape
+    patch_h = H // patch_size
+    patch_w = W // patch_size
+
+    # Verify dimensions match
+    if patch_h * patch_w != n_patches:
+        # Fallback to square assumption
+        patch_h = patch_w = int(np.sqrt(n_patches))
 
     features_centered = features - features.mean(axis=0)
 
@@ -121,7 +130,7 @@ def visualize_features_pca(features: np.ndarray, img_shape: tuple[int, int]) -> 
         else:
             features_3d[:, i] = 128
 
-    features_img = features_3d.reshape(patch_size, patch_size, 3).astype(np.uint8)
+    features_img = features_3d.reshape(patch_h, patch_w, 3).astype(np.uint8)
     features_pil = Image.fromarray(features_img)
     features_pil = features_pil.resize(img_shape[::-1], Image.Resampling.NEAREST)
 
