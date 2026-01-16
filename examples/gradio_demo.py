@@ -289,6 +289,13 @@ def convert_to_glb(
         all_pts = []
         all_colors = []
         for img, pts, conf in zip(imgs, pts3d, confs):
+            # Resize image if it doesn't match pts3d shape
+            if img.shape[:2] != pts.shape[:2]:
+                from PIL import Image as PILImage
+                img_pil = PILImage.fromarray(img)
+                img_pil = img_pil.resize((pts.shape[1], pts.shape[0]), PILImage.Resampling.LANCZOS)
+                img = np.array(img_pil)
+
             mask = (conf.squeeze() > min_conf_thr) & np.isfinite(pts.sum(axis=-1))
             all_pts.append(flip_points(pts[mask]))
             all_colors.append(img[mask])
@@ -308,6 +315,13 @@ def convert_to_glb(
         vert_offset = 0
 
         for img, pts, conf in zip(imgs, pts3d, confs):
+            # Resize image if it doesn't match pts3d shape
+            if img.shape[:2] != pts.shape[:2]:
+                from PIL import Image as PILImage
+                img_pil = PILImage.fromarray(img)
+                img_pil = img_pil.resize((pts.shape[1], pts.shape[0]), PILImage.Resampling.LANCZOS)
+                img = np.array(img_pil)
+
             mask = (conf.squeeze() > min_conf_thr) & np.isfinite(pts.sum(axis=-1))
             mesh_data = pts3d_to_trimesh_simple(img, flip_points(pts), mask)
 
