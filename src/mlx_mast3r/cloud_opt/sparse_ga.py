@@ -1254,15 +1254,29 @@ def sparse_scene_optimizer(
 
         # Subsample confidence to match depth resolution
         conf_i = img_confs[i]
+        n_pts = H_sub * W_sub
+
+        # Try to subsample based on shape
         if conf_i.shape[0] == H and conf_i.shape[1] == W:
-            # Full resolution conf -> subsample to match depth
+            # Full resolution conf (H, W) -> subsample to match depth
             conf_sparse = conf_i[::subsample, ::subsample].reshape(-1)
+        elif conf_i.shape[0] == W and conf_i.shape[1] == H:
+            # Transposed full resolution (W, H) -> transpose then subsample
+            conf_sparse = conf_i.T[::subsample, ::subsample].reshape(-1)
         elif conf_i.shape[0] == H_sub and conf_i.shape[1] == W_sub:
-            # Already subsampled
+            # Already subsampled with correct orientation
             conf_sparse = conf_i.reshape(-1)
+        elif conf_i.shape[0] == W_sub and conf_i.shape[1] == H_sub:
+            # Already subsampled but transposed
+            conf_sparse = conf_i.T.reshape(-1)
         else:
-            # Unknown shape, just flatten
-            conf_sparse = conf_i.reshape(-1)
+            # Fallback: take first n_pts elements or pad with 1.0
+            conf_flat = conf_i.reshape(-1)
+            if len(conf_flat) >= n_pts:
+                conf_sparse = conf_flat[:n_pts]
+            else:
+                conf_sparse = mx.concatenate([conf_flat, mx.ones(n_pts - len(conf_flat))])
+
         confs_list.append(conf_sparse)
 
     # Fetch actual images from pairs
