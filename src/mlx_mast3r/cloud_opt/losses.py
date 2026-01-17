@@ -110,8 +110,8 @@ def gamma_loss(gamma: float) -> Callable:
         Returns:
             Per-point losses [N] if weight is None, else scalar
         """
-        # L2 distance per point
-        l2 = mx.sqrt(mx.sum((x - y) ** 2, axis=-1) + 1e-8)
+        # L2 distance per point (no epsilon, matches PyTorch torch.linalg.norm)
+        l2 = mx.sqrt(mx.sum((x - y) ** 2, axis=-1))
 
         # Apply gamma transformation
         loss = (l2 + offset) ** gamma - offset**gamma

@@ -17,15 +17,8 @@ import mlx.core as mx
 import numpy as np
 
 from .geometry import depthmap_to_pts3d, geotrf, inv
-from .losses import gamma_loss
-from .optimizer import (
-    OptimConfig,
-    SceneOptimizer,
-    build_mst_from_correspondences,
-    make_pts3d_from_depth,
-    optimize_scene,
-)
-from .schedules import cosine_schedule
+from .optimizer import build_mst_from_correspondences
+from .optimizer import sparse_scene_optimizer as _sparse_optimizer_core
 
 
 def anchor_depth_offsets(
@@ -215,9 +208,10 @@ def sparse_global_alignment(
     shared_intrinsics: bool = False,
     lr1: float = 0.07,
     niter1: int = 300,
-    lr2: float = 0.01,
+    lr2: float = 0.01,  # PyTorch default
     niter2: int = 300,
     matching_conf_thr: float = 5.0,
+    loss_dust3r_w: float = 0.01,  # PyTorch default
     verbose: bool = True,
 ) -> SparseGAResult:
     """Sparse alignment with MASt3R MLX.
@@ -235,6 +229,7 @@ def sparse_global_alignment(
         lr1, niter1: Coarse alignment parameters
         lr2, niter2: Fine refinement parameters
         matching_conf_thr: Minimum matching confidence threshold
+        loss_dust3r_w: Weight for DUSt3R loss regularization (default 0.01)
         verbose: Print progress
 
     Returns:
@@ -304,12 +299,14 @@ def sparse_global_alignment(
         anchor_data=anchor_data,
         corres=corres,
         canonical_paths=canonical_paths,
+        preds_21=preds_21,
         lr1=lr1,
         niter1=niter1,
         lr2=lr2,
         niter2=niter2,
         shared_intrinsics=shared_intrinsics,
         matching_conf_thr=matching_conf_thr,
+        loss_dust3r_w=loss_dust3r_w,
         verbose=verbose,
     )
 
@@ -470,40 +467,132 @@ def symmetric_inference(
     # res22: view 2 in its own frame (from 2→1 pass)
     # res12: view 1 in view 2's frame (from 2→1 pass)
 
-    def get_conf(out):
-        conf = out.get("conf", None)
+    def get_conf(out, key="conf"):
+        """Get confidence map, with fallback to uniform confidence."""
+        conf = out.get(key, None)
         if conf is None:
-            # Fallback: create uniform confidence
-            pts3d = out["pts3d"]
-            return np.ones(pts3d.shape[:2], dtype=np.float32)
+            # Fallback: try 'conf' if key was 'desc_conf'
+            if key == "desc_conf":
+                conf = out.get("conf", None)
+            if conf is None:
+                # Final fallback: uniform confidence
+                pts3d = out["pts3d"]
+                return np.ones(pts3d.shape[:2], dtype=np.float32)
         return np.array(conf).squeeze() if hasattr(conf, "__array__") else conf
 
     res11 = {
         "pts3d": mx.array(out1_12["pts3d"]),
-        "conf": mx.array(get_conf(out1_12)),
+        "conf": mx.array(get_conf(out1_12, "conf")),
         "desc": mx.array(out1_12.get("desc", np.zeros((*out1_12["pts3d"].shape[:2], 24)))),
-        "desc_conf": mx.array(get_conf(out1_12)),
+        "desc_conf": mx.array(get_conf(out1_12, "desc_conf")),  # Use desc_conf!
     }
     res21 = {
         "pts3d": mx.array(out2_12["pts3d"]),
-        "conf": mx.array(get_conf(out2_12)),
+        "conf": mx.array(get_conf(out2_12, "conf")),
         "desc": mx.array(out2_12.get("desc", np.zeros((*out2_12["pts3d"].shape[:2], 24)))),
-        "desc_conf": mx.array(get_conf(out2_12)),
+        "desc_conf": mx.array(get_conf(out2_12, "desc_conf")),  # Use desc_conf!
     }
     res22 = {
         "pts3d": mx.array(out1_21["pts3d"]),
-        "conf": mx.array(get_conf(out1_21)),
+        "conf": mx.array(get_conf(out1_21, "conf")),
         "desc": mx.array(out1_21.get("desc", np.zeros((*out1_21["pts3d"].shape[:2], 24)))),
-        "desc_conf": mx.array(get_conf(out1_21)),
+        "desc_conf": mx.array(get_conf(out1_21, "desc_conf")),  # Use desc_conf!
     }
     res12 = {
         "pts3d": mx.array(out2_21["pts3d"]),
-        "conf": mx.array(get_conf(out2_21)),
+        "conf": mx.array(get_conf(out2_21, "conf")),
         "desc": mx.array(out2_21.get("desc", np.zeros((*out2_21["pts3d"].shape[:2], 24)))),
-        "desc_conf": mx.array(get_conf(out2_21)),
+        "desc_conf": mx.array(get_conf(out2_21, "desc_conf")),  # Use desc_conf!
     }
 
     return res11, res21, res22, res12
+
+
+def _fast_reciprocal_nns(A: np.ndarray, B: np.ndarray, subsample: int) -> tuple[np.ndarray, np.ndarray]:
+    """Iterative reciprocal nearest neighbor matching like PyTorch fast_reciprocal_NNs.
+
+    Uses full-resolution features for matching but starts from subsampled points.
+
+    Args:
+        A: Features from image 1 [H1, W1, D]
+        B: Features from image 2 [H2, W2, D]
+        subsample: Initial subsampling factor
+
+    Returns:
+        Tuple of (idx1, idx2) flat indices into A and B
+    """
+    H1, W1, D = A.shape
+    H2, W2, D2 = B.shape
+    assert D == D2
+
+    A_flat = A.reshape(-1, D)
+    B_flat = B.reshape(-1, D)
+
+    # Normalize for dot product
+    A_norm = A_flat / (np.linalg.norm(A_flat, axis=-1, keepdims=True) + 1e-8)
+    B_norm = B_flat / (np.linalg.norm(B_flat, axis=-1, keepdims=True) + 1e-8)
+
+    # Start from subsampled points
+    S = subsample
+    y1, x1 = np.mgrid[S // 2 : H1 : S, S // 2 : W1 : S].reshape(2, -1)
+    xy1 = np.int32(np.unique(x1 + W1 * y1))  # Flat indices into A
+    xy2 = np.full_like(xy1, -1)  # Matching indices in B
+
+    max_iter = 10
+    old_xy1 = xy1.copy()
+    notyet = np.ones(len(xy1), dtype=bool)
+
+    for _ in range(max_iter):
+        if not notyet.any():
+            break
+
+        # Find best match in B for each point in A
+        sims = A_norm[xy1[notyet]] @ B_norm.T
+        xy2[notyet] = np.argmax(sims, axis=1)
+
+        # Find best match in A for each matched point in B
+        sims_back = B_norm[xy2[notyet]] @ A_norm.T
+        xy1[notyet] = np.argmax(sims_back, axis=1)
+
+        # Check convergence
+        notyet &= old_xy1 != xy1
+        old_xy1[:] = xy1
+
+    # Keep only converged (reciprocal) matches
+    converged = ~notyet
+    return xy1[converged], xy2[converged]
+
+
+def _merge_corres(idx1: np.ndarray, idx2: np.ndarray, shape1: tuple, shape2: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge correspondences and convert to xy coordinates.
+
+    Like PyTorch merge_corres function.
+
+    Args:
+        idx1: Flat indices into image 1
+        idx2: Flat indices into image 2
+        shape1: (H1, W1) of image 1
+        shape2: (H2, W2) of image 2
+
+    Returns:
+        Tuple of (xy1, xy2, indices) - indices map to original arrays
+    """
+    idx1 = idx1.astype(np.int32)
+    idx2 = idx2.astype(np.int32)
+
+    # Unique and sort along idx1, return indices
+    combined = np.c_[idx2, idx1].view(np.int64)
+    unique_combined, indices = np.unique(combined, return_index=True)
+    xy2_flat, xy1_flat = unique_combined[:, None].view(np.int32).T
+
+    # Convert to xy coordinates
+    y1, x1 = np.unravel_index(xy1_flat, shape1)
+    y2, x2 = np.unravel_index(xy2_flat, shape2)
+
+    xy1 = np.stack([x1, y1], axis=-1).astype(np.float32)
+    xy2 = np.stack([x2, y2], axis=-1).astype(np.float32)
+
+    return xy1, xy2, indices
 
 
 def extract_correspondences(
@@ -513,12 +602,13 @@ def extract_correspondences(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract correspondences from descriptor features.
 
-    Uses reciprocal nearest neighbor matching.
+    Uses iterative reciprocal nearest neighbor matching like PyTorch MASt3R.
+    Works on full-resolution features for better matching quality.
 
     Args:
         feats: List of descriptor features [feat11, feat21, feat22, feat12]
         qonfs: List of confidence maps
-        subsample: Subsampling factor
+        subsample: Initial subsampling factor
 
     Returns:
         Tuple of (xy1, xy2, confidences)
@@ -529,80 +619,52 @@ def extract_correspondences(
     H1, W1 = feat11.shape[:2]
     H2, W2 = feat22.shape[:2]
 
-    # Create pixel grids
-    y1, x1 = np.mgrid[0:H1:subsample, 0:W1:subsample]
-    y2, x2 = np.mgrid[0:H2:subsample, 0:W2:subsample]
+    # Convert to numpy for matching
+    feat11_np = np.array(feat11)
+    feat21_np = np.array(feat21)
+    feat22_np = np.array(feat22)
+    feat12_np = np.array(feat12)
 
-    xy1_grid = np.stack([x1.ravel(), y1.ravel()], axis=-1).astype(np.float32)
-    xy2_grid = np.stack([x2.ravel(), y2.ravel()], axis=-1).astype(np.float32)
+    qonf11_np = np.array(qonf11).ravel()
+    qonf21_np = np.array(qonf21).ravel()
+    qonf22_np = np.array(qonf22).ravel()
+    qonf12_np = np.array(qonf12).ravel()
 
-    # Subsample features
-    feat11_sub = np.array(feat11[::subsample, ::subsample]).reshape(-1, feat11.shape[-1])
-    feat21_sub = np.array(feat21[::subsample, ::subsample]).reshape(-1, feat21.shape[-1])
-    feat22_sub = np.array(feat22[::subsample, ::subsample]).reshape(-1, feat22.shape[-1])
-    feat12_sub = np.array(feat12[::subsample, ::subsample]).reshape(-1, feat12.shape[-1])
+    all_idx1 = []
+    all_idx2 = []
+    all_qonf1 = []
+    all_qonf2 = []
 
-    # Subsample confidences
-    qonf11_sub = np.array(qonf11[::subsample, ::subsample]).ravel()
-    qonf21_sub = np.array(qonf21[::subsample, ::subsample]).ravel()
-    qonf22_sub = np.array(qonf22[::subsample, ::subsample]).ravel()
-    qonf12_sub = np.array(qonf12[::subsample, ::subsample]).ravel()
-
-    # Normalize features for dot product matching
-    feat11_sub = feat11_sub / (np.linalg.norm(feat11_sub, axis=-1, keepdims=True) + 1e-8)
-    feat21_sub = feat21_sub / (np.linalg.norm(feat21_sub, axis=-1, keepdims=True) + 1e-8)
-    feat22_sub = feat22_sub / (np.linalg.norm(feat22_sub, axis=-1, keepdims=True) + 1e-8)
-    feat12_sub = feat12_sub / (np.linalg.norm(feat12_sub, axis=-1, keepdims=True) + 1e-8)
-
-    all_xy1 = []
-    all_xy2 = []
-    all_confs = []
-
-    # Match 1→2 and 2→1 for both pairs
-    for A, B, QA, QB, xyA, xyB in [
-        (feat11_sub, feat21_sub, qonf11_sub, qonf21_sub, xy1_grid, xy2_grid),
-        (feat12_sub, feat22_sub, qonf12_sub, qonf22_sub, xy1_grid, xy2_grid),
+    # Match both pairs in both directions (like PyTorch)
+    for A, B, QA, QB in [
+        (feat11_np, feat21_np, qonf11_np, qonf21_np),
+        (feat12_np, feat22_np, qonf12_np, qonf22_np),
     ]:
-        # Compute similarity matrix
-        sim = A @ B.T
+        # Forward matching: A → B
+        nn1to2_idx1, nn1to2_idx2 = _fast_reciprocal_nns(A, B, subsample)
+        # Backward matching: B → A
+        nn2to1_idx2, nn2to1_idx1 = _fast_reciprocal_nns(B, A, subsample)
 
-        # Find best matches A→B
-        best_B = np.argmax(sim, axis=1)
-        # Find best matches B→A
-        best_A = np.argmax(sim, axis=0)
+        # Concatenate both directions (like PyTorch)
+        all_idx1.append(np.r_[nn1to2_idx1, nn2to1_idx1])
+        all_idx2.append(np.r_[nn1to2_idx2, nn2to1_idx2])
+        all_qonf1.append(QA[np.r_[nn1to2_idx1, nn2to1_idx1]])
+        all_qonf2.append(QB[np.r_[nn1to2_idx2, nn2to1_idx2]])
 
-        # Reciprocal matches
-        mutual_A = np.arange(len(A))
-        mutual_B = best_B
-        is_mutual = best_A[best_B] == mutual_A
+    # Merge all correspondences
+    idx1 = np.concatenate(all_idx1).astype(np.int32)
+    idx2 = np.concatenate(all_idx2).astype(np.int32)
+    qonf1 = np.concatenate(all_qonf1)
+    qonf2 = np.concatenate(all_qonf2)
 
-        # Keep only mutual matches
-        valid_A = mutual_A[is_mutual]
-        valid_B = mutual_B[is_mutual]
+    # Merge and deduplicate (like PyTorch merge_corres)
+    xy1, xy2, merge_indices = _merge_corres(idx1, idx2, (H1, W1), (H2, W2))
 
-        all_xy1.append(xyA[valid_A])
-        all_xy2.append(xyB[valid_B])
-        all_confs.append(np.sqrt(QA[valid_A] * QB[valid_B]))
-
-    # Concatenate all matches
-    xy1 = np.concatenate(all_xy1, axis=0)
-    xy2 = np.concatenate(all_xy2, axis=0)
-    confs = np.concatenate(all_confs, axis=0)
-
-    # Remove duplicates
-    unique_pairs = {}
-    for i in range(len(xy1)):
-        key = (int(xy1[i, 0]), int(xy1[i, 1]), int(xy2[i, 0]), int(xy2[i, 1]))
-        if key not in unique_pairs or confs[i] > unique_pairs[key][2]:
-            unique_pairs[key] = (xy1[i], xy2[i], confs[i])
-
-    if unique_pairs:
-        xy1 = np.array([v[0] for v in unique_pairs.values()])
-        xy2 = np.array([v[1] for v in unique_pairs.values()])
-        confs = np.array([v[2] for v in unique_pairs.values()])
+    # Use the merged confidences exactly like PyTorch
+    if len(xy1) > 0:
+        # PyTorch: confs = np.sqrt(cat(qonf1)[idx] * cat(qonf2)[idx])
+        confs = np.sqrt(qonf1[merge_indices] * qonf2[merge_indices])
     else:
-        xy1 = np.zeros((0, 2), dtype=np.float32)
-        xy2 = np.zeros((0, 2), dtype=np.float32)
         confs = np.zeros(0, dtype=np.float32)
 
     return xy1, xy2, confs
@@ -820,7 +882,8 @@ def estimate_focal_from_depth(
 ) -> mx.array:
     """Estimate focal length from depth map.
 
-    Uses Weiszfeld algorithm for robust estimation.
+    Matches PyTorch MASt3R/DUSt3R estimate_focal_knowing_depth function.
+    Uses median voting for robust focal estimation.
 
     Args:
         pts3d: Pointmap [H, W, 3]
@@ -834,32 +897,40 @@ def estimate_focal_from_depth(
     H, W = pts3d.shape[:2]
     size = max(H, W)
 
-    # Get valid points
+    # Get valid points (positive depth, non-zero X and Y)
     z = pts3d[..., 2]
-    valid = z > 0.1
+    x_3d = pts3d[..., 0]
+    y_3d = pts3d[..., 1]
 
-    if mx.sum(valid) < 10:
+    # Create pixel coordinates centered at principal point
+    # Match PyTorch: pixels = xy_grid(W, H) - pp
+    yy, xx = mx.meshgrid(mx.arange(H), mx.arange(W), indexing="ij")
+    u = xx.astype(mx.float32) - pp[0]  # Centered x pixel coord
+    v = yy.astype(mx.float32) - pp[1]  # Centered y pixel coord
+
+    # Compute focal votes like PyTorch: fx = (u * z) / x, fy = (v * z) / y
+    # Avoid division by zero
+    eps = 1e-8
+    fx_votes = (u * z) / (x_3d + mx.sign(x_3d) * eps + (mx.abs(x_3d) < eps) * eps)
+    fy_votes = (v * z) / (y_3d + mx.sign(y_3d) * eps + (mx.abs(y_3d) < eps) * eps)
+
+    # Valid mask: positive depth and non-small X, Y
+    valid = (z > 0.1) & (mx.abs(x_3d) > eps) & (mx.abs(y_3d) > eps)
+
+    # Combine fx and fy votes, take median
+    focal_np_fx = np.array(fx_votes).flatten()
+    focal_np_fy = np.array(fy_votes).flatten()
+    valid_np = np.array(valid).flatten()
+
+    # Filter valid and finite values
+    f_votes = np.concatenate([focal_np_fx[valid_np], focal_np_fy[valid_np]])
+    f_votes = f_votes[np.isfinite(f_votes)]
+
+    if len(f_votes) < 10:
         return mx.array(size * 1.0)
 
-    # Create pixel coordinates
-    y, x = mx.meshgrid(mx.arange(H), mx.arange(W), indexing="ij")
-    xy = mx.stack([x, y], axis=-1).astype(mx.float32)
-
-    # Centered coordinates
-    xy_centered = xy - pp
-
-    # Estimate focal from z/d relationship
-    # f = z * sqrt((x-cx)^2 + (y-cy)^2) / sqrt(X^2 + Y^2)
-    d_pixel = mx.sqrt(mx.sum(xy_centered**2, axis=-1) + 1e-8)
-    d_3d = mx.sqrt(pts3d[..., 0] ** 2 + pts3d[..., 1] ** 2 + 1e-8)
-
-    focal_estimates = z * d_pixel / (d_3d + 1e-8)
-
-    # Robust median - use numpy for boolean indexing (not supported in MLX)
-    focal_np = np.array(focal_estimates).flatten()
-    valid_np = np.array(valid).flatten()
-    focal_estimates_valid = focal_np[valid_np]
-    focal = mx.array(np.median(focal_estimates_valid))
+    # Median as robust estimate (matches PyTorch nanmedian)
+    focal = mx.array(np.nanmedian(f_votes))
 
     # Clamp to reasonable range
     focal = mx.clip(focal, min_focal * size, max_focal * size)
@@ -873,7 +944,11 @@ def condense_data(
     canonical_views: dict,
     preds_21: dict,
 ) -> tuple:
-    """Condense all data for optimization.
+    """Condense all data for optimization (PyTorch-faithful version).
+
+    This matches PyTorch MASt3R's condense_data structure:
+    - anchor_data[idx] = (pixels, idxs, offsets) aggregated per source image
+    - corres contains slices into anchor_data for each pair
 
     Args:
         imgs: List of image paths
@@ -892,9 +967,9 @@ def condense_data(
     core_depth = []
     confs = []  # Confidence maps for each image
     anchors = {}
-    anchor_data = {}  # NEW: For make_pts3d_from_depth (pixels, idxs, offsets)
+    anchor_data = {}  # {idx: (pixels, idxs, offsets)} aggregated per image
+    tmp_pixels = {}   # {(img1, img2): (pixels, confs, slice)} for slice tracking
     corres = []
-    corres2d = []
 
     for idx, img in enumerate(imgs):
         cv = canonical_views[img]
@@ -910,20 +985,21 @@ def condense_data(
         anchor_idxs = cv.get("anchor_idxs", {})
         anchor_offs = cv.get("anchor_offs", {})
 
-        # Build anchor data
+        # Build aggregated anchor data with slice tracking (like PyTorch)
         pixels_data = cv["pixels"]
         all_pixels = []
         all_idxs = []
         all_offs = []
         all_confs = []
+        cur_n = [0]  # Track slice positions
 
         for other_img, pixel_data in pixels_data.items():
-            # Unpack (pts1, pts2, conf) or legacy (pts1, conf) format
+            # Unpack (pts1, pts2, conf)
             if len(pixel_data) == 3:
                 pixels, pixels2, conf = pixel_data
             else:
                 pixels, conf = pixel_data
-                pixels2 = pixels  # Fallback for legacy format
+                pixels2 = pixels
 
             all_pixels.append(pixels)
             all_confs.append(conf)
@@ -933,17 +1009,9 @@ def condense_data(
                 all_idxs.append(anchor_idxs[other_img])
                 all_offs.append(anchor_offs[other_img])
 
-            # Build correspondence entry with both pts1 and pts2
-            other_idx = imgs.index(other_img)
-            corres.append(
-                {
-                    "idx1": idx,
-                    "idx2": other_idx,
-                    "pts1": pixels,
-                    "pts2": pixels2,
-                    "weights": conf,
-                }
-            )
+            # Track slice position (like PyTorch tmp_pixels)
+            cur_n.append(cur_n[-1] + len(pixels))
+            tmp_pixels[img, other_img] = (pixels, pixels2, conf, slice(cur_n[-2], cur_n[-1]))
 
         if all_pixels:
             all_pixels = mx.concatenate(all_pixels, axis=0)
@@ -952,8 +1020,7 @@ def condense_data(
             all_pixels = mx.zeros((0, 2))
             all_confs = mx.zeros(0)
 
-        # Build anchor_data for make_pts3d_from_depth
-        # Format: (pixels, idxs, offsets)
+        # Build anchor_data for make_pts3d (like PyTorch img_anchors)
         if all_idxs and all_offs:
             all_idxs_cat = mx.concatenate(all_idxs, axis=0)
             all_offs_cat = mx.concatenate(all_offs, axis=0)
@@ -964,6 +1031,38 @@ def condense_data(
             "confs": all_confs,
         }
 
+    # Build correspondences with slices (like PyTorch imgs_slices)
+    # Note: PyTorch filters by matching_conf_thr in loss calculation, not here
+    seen_pairs = set()
+    for (img1, img2), (pix1, pix2_fwd, conf1, slice1) in tmp_pixels.items():
+        # Only process each pair once
+        pair_key = tuple(sorted([img1, img2]))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+
+        # Get reverse mapping
+        if (img2, img1) not in tmp_pixels:
+            continue
+        pix2_rev, pix1_rev, conf2, slice2 = tmp_pixels[img2, img1]
+
+        idx1 = imgs.index(img1)
+        idx2 = imgs.index(img2)
+
+        # Confidences are geometric mean like PyTorch
+        conf = mx.sqrt(conf1 * conf2)
+
+        corres.append({
+            "idx1": idx1,
+            "idx2": idx2,
+            "slice1": slice1,  # Slice into anchor_data[idx1]
+            "slice2": slice2,  # Slice into anchor_data[idx2]
+            "pts1": pix1,      # 2D pixel coords in img1
+            "pts2": pix2_fwd,  # 2D pixel coords in img2
+            "weights": conf,
+            "max_conf": float(mx.max(conf)),  # For filtering
+        })
+
     return (
         imsizes,
         pps,
@@ -971,9 +1070,9 @@ def condense_data(
         core_depth,
         confs,
         anchors,
-        anchor_data,  # NEW: Added anchor_data
+        anchor_data,
         corres,
-        corres2d,
+        [],  # corres2d (unused)
     )
 
 
@@ -990,15 +1089,17 @@ def sparse_scene_optimizer(
     anchor_data: dict,
     corres: list[dict],
     canonical_paths: list[str] | None,
+    preds_21: dict | None = None,
     lr1: float = 0.07,
     niter1: int = 300,
-    lr2: float = 0.01,
+    lr2: float = 0.01,  # PyTorch default
     niter2: int = 300,
     shared_intrinsics: bool = False,
     matching_conf_thr: float = 5.0,
+    loss_dust3r_w: float = 0.01,
     verbose: bool = True,
 ) -> SparseGAResult:
-    """Run sparse scene optimization.
+    """Run sparse scene optimization using PyTorch-faithful v2 optimizer.
 
     Two-phase optimization:
     1. Coarse alignment with 3D point matching loss
@@ -1017,10 +1118,12 @@ def sparse_scene_optimizer(
         anchor_data: Dict of (pixels, idxs, offsets) per image for make_pts3d
         corres: Correspondences
         canonical_paths: Cache paths
+        preds_21: Cross-predictions for dust3r loss regularization
         lr1, niter1: Coarse phase parameters
         lr2, niter2: Fine phase parameters
         shared_intrinsics: Use single intrinsics
         matching_conf_thr: Confidence threshold
+        loss_dust3r_w: Weight for dust3r loss (default 0.01 like PyTorch)
         verbose: Print progress
 
     Returns:
@@ -1030,10 +1133,13 @@ def sparse_scene_optimizer(
 
     # Convert to MLX arrays
     init_focals = mx.stack([mx.array(f).reshape(()) for f in base_focals])
-    init_pps = mx.stack([pp / mx.array([w, h]) for pp, (h, w) in zip(pps, imsizes)])
 
-    # Flatten and stack depths
+    if verbose:
+        print(f"init focals = {[float(f) for f in init_focals]}")
+
+    # Prepare depths and compute medians (like PyTorch)
     init_depths = []
+    median_depths = []
     for i, depth in enumerate(core_depth):
         H, W = imsizes[i]
         H_sub = (H + subsample - 1) // subsample
@@ -1045,120 +1151,77 @@ def sparse_scene_optimizer(
             d = mx.pad(d, [(0, expected_size - len(d))])
         elif len(d) > expected_size:
             d = d[:expected_size]
-        init_depths.append(d.reshape(H_sub, W_sub))
+        d_2d = d.reshape(H_sub, W_sub)
+        init_depths.append(d_2d)
 
-    # Build MST from correspondences for kinematic chain
-    # Use input corres (already available) to build the MST
+        # Compute median depth (like PyTorch core_depth /= median)
+        median = float(mx.median(d))
+        median = max(median, 1e-6)  # Avoid zero
+        median_depths.append(median)
+
+    median_depths = mx.array(median_depths)
+
+    # Normalize core depths by median (like PyTorch)
+    normalized_depths = []
+    for i, d in enumerate(init_depths):
+        normalized_depths.append(d / median_depths[i])
+
+    # Build MST from correspondences
     mst_parent_map, mst_root = build_mst_from_correspondences(corres, n_imgs)
 
+    # Convert MST format: {child: parent} -> (root, [(parent, child), ...])
+    mst_edges = []
+    for child, parent in mst_parent_map.items():
+        mst_edges.append((parent, child))
+    mst = (mst_root, mst_edges)
+
     if verbose:
-        print(f"Built MST with root={mst_root}, edges={len(mst_parent_map)}")
+        print(f"Built MST with root={mst_root}, edges={len(mst_edges)}")
 
-    # Create optimizer with MST
-    optimizer = SceneOptimizer(
-        n_images=n_imgs,
-        image_sizes=imsizes,
-        init_focals=init_focals,
-        init_pps=init_pps,
-        init_depths=init_depths,
+    # Correspondences are already formatted with slices from condense_data
+    # Just use them directly (like PyTorch imgs_slices)
+    opt_corres = corres  # Contains: idx1, idx2, slice1, slice2, pts1, pts2, weights
+
+    # Run PyTorch-faithful optimizer
+    if verbose:
+        print("Running scene optimization...")
+
+    result = _sparse_optimizer_core(
+        imgs=imgs,
+        imsizes=imsizes,
+        pps=pps,
+        base_focals=init_focals,
+        core_depth=normalized_depths,  # Normalized by median
+        median_depths=median_depths,
+        img_anchors=anchor_data,  # {idx: (pixels, idxs, offsets)}
+        corres=opt_corres,
+        preds_21=preds_21 or {},
+        mst=mst,
         subsample=subsample,
-        shared_intrinsics=shared_intrinsics,
-        mst_edges=mst_parent_map,
-    )
-
-    # Build canonical 3D points from depths
-    canonical_pts3d = []
-    for i in range(n_imgs):
-        H, W = imsizes[i]
-        depth = init_depths[i]
-
-        # Create pixel grid
-        H_sub, W_sub = depth.shape
-        y, x = mx.meshgrid(
-            mx.arange(H_sub) * subsample + subsample // 2,
-            mx.arange(W_sub) * subsample + subsample // 2,
-            indexing="ij",
-        )
-        xy = mx.stack([x, y], axis=-1).reshape(-1, 2).astype(mx.float32)
-
-        # Unproject to 3D
-        f = init_focals[i]
-        pp = pps[i]
-        z = depth.reshape(-1)
-
-        x_norm = (xy[:, 0] - pp[0]) / f
-        y_norm = (xy[:, 1] - pp[1]) / f
-
-        pts3d = mx.stack([x_norm * z, y_norm * z, z], axis=-1)
-        canonical_pts3d.append(pts3d)
-
-    # Format correspondences for optimizer
-    opt_corres = []
-    for c in corres:
-        idx1 = c["idx1"]
-        idx2 = c["idx2"]
-        pts1 = c["pts1"]
-        pts2 = c.get("pts2", pts1)  # Use pts2 if available, fallback to pts1
-        weights = c.get("weights", mx.ones(len(pts1)))
-
-        # Find matching points in canonical data
-        H1, W1 = imsizes[idx1]
-        H_sub1 = (H1 + subsample - 1) // subsample
-        W_sub1 = (W1 + subsample - 1) // subsample
-
-        # Convert pts1 pixel coords to subsampled indices
-        pts1_sub = (pts1 / subsample).astype(mx.int32)
-        pts1_sub = mx.clip(pts1_sub, 0, mx.array([W_sub1 - 1, H_sub1 - 1]))
-        pts1_idx = pts1_sub[:, 1] * W_sub1 + pts1_sub[:, 0]
-
-        # Convert pts2 pixel coords to subsampled indices
-        H2, W2 = imsizes[idx2]
-        H_sub2 = (H2 + subsample - 1) // subsample
-        W_sub2 = (W2 + subsample - 1) // subsample
-        pts2_sub = (pts2 / subsample).astype(mx.int32)
-        pts2_sub = mx.clip(pts2_sub, 0, mx.array([W_sub2 - 1, H_sub2 - 1]))
-        pts2_idx = pts2_sub[:, 1] * W_sub2 + pts2_sub[:, 0]
-
-        opt_corres.append(
-            {
-                "idx1": idx1,
-                "idx2": idx2,
-                "pts1_idx": pts1_idx,
-                "pts2_idx": pts2_idx,
-                "pts1": pts1,
-                "pts2": pts2,
-                "weights": weights,
-            }
-        )
-
-    # Create optimization config
-    config = OptimConfig(
         lr1=lr1,
         niter1=niter1,
         lr2=lr2,
         niter2=niter2,
+        exp_depth=False,  # PyTorch default
         shared_intrinsics=shared_intrinsics,
-    )
-
-    # Run optimization
-    if verbose:
-        print("Running scene optimization...")
-
-    optimizer = optimize_scene(
-        optimizer=optimizer,
-        corres=opt_corres,
-        canonical_pts3d=canonical_pts3d,
-        config=config,
-        anchor_data=anchor_data,  # Pass anchor data for precise 3D reconstruction
+        matching_conf_thr=matching_conf_thr,
+        loss_dust3r_w=loss_dust3r_w,
         verbose=verbose,
     )
 
-    # Extract results - poses and depths already have global_scaling applied
-    poses = optimizer.get_poses()
-    focals = optimizer.get_focals()
-    pps_out = optimizer.get_principal_points()
-    depths = optimizer.get_depths()
-    sizes = optimizer.sizes  # Optimized scale factors per view
+    # Extract results
+    poses = result["cam2w"]
+    focals = result["focals"]
+    pps_norm = result["pps_norm"]
+    depths = result["depthmaps"]
+    log_sizes = result.get("log_sizes", mx.zeros(n_imgs))
+
+    # Convert normalized pps back to pixel coordinates
+    pps_out_list = []
+    for i in range(n_imgs):
+        H, W = imsizes[i]
+        pps_out_list.append(pps_norm[i] * mx.array([float(W), float(H)]))
+    pps_out = mx.stack(pps_out_list)
 
     # Compute final 3D points
     pts3d_list = []
@@ -1170,27 +1233,37 @@ def sparse_scene_optimizer(
         depth = depths[i] if depths else mx.ones((H, W))
 
         # Build intrinsics
-        K = mx.array(
-            [
-                [focals[i], 0, pps_out[i, 0]],
-                [0, focals[i], pps_out[i, 1]],
-                [0, 0, 1],
-            ]
-        )
+        K = mx.array([
+            [focals[i], 0, pps_out[i, 0]],
+            [0, focals[i], pps_out[i, 1]],
+            [0, 0, 1],
+        ])
 
         # Unproject and transform
         pts3d = depthmap_to_pts3d(depth, K)
         pts3d_world = geotrf(poses[i], pts3d.reshape(-1, 3))
 
-        # Subsample for sparse output
-        pts3d_sparse = pts3d_world[:: subsample * subsample]
-        pts3d_list.append(pts3d_sparse)
+        # depths is already subsampled by optimizer, so pts3d_world matches
+        # depth shape is (H_sub, W_sub), pts3d_world is (H_sub * W_sub, 3)
+        H_sub = depth.shape[0]
+        W_sub = depth.shape[1]
+        pts3d_list.append(pts3d_world)
 
-        # Get colors (placeholder - would need actual images)
-        pts3d_colors.append(np.ones((len(pts3d_sparse), 3)) * 0.5)
+        # Colors placeholder
+        pts3d_colors.append(np.ones((len(pts3d_world), 3)) * 0.5)
 
-        # Use actual confidence from model
-        confs_list.append(img_confs[i])
+        # Subsample confidence to match depth resolution
+        conf_i = img_confs[i]
+        if conf_i.shape[0] == H and conf_i.shape[1] == W:
+            # Full resolution conf -> subsample to match depth
+            conf_sparse = conf_i[::subsample, ::subsample].reshape(-1)
+        elif conf_i.shape[0] == H_sub and conf_i.shape[1] == W_sub:
+            # Already subsampled
+            conf_sparse = conf_i.reshape(-1)
+        else:
+            # Unknown shape, just flatten
+            conf_sparse = conf_i.reshape(-1)
+        confs_list.append(conf_sparse)
 
     # Fetch actual images from pairs
     imgs_array = []
@@ -1199,17 +1272,13 @@ def sparse_scene_optimizer(
         for img1, img2 in pairs_in:
             if img1["instance"] == im:
                 img_tensor = np.array(img1["img"]).astype(np.float32)
-                # Convert from CHW to HWC
                 if img_tensor.ndim == 4:
                     img_tensor = img_tensor[0]
                 if img_tensor.shape[0] == 3:
                     img_tensor = img_tensor.transpose(1, 2, 0)
-                # Denormalize based on value range
                 if img_tensor.max() > 1.0:
-                    # uint8 [0-255] -> [0-1]
                     return np.clip(img_tensor / 255.0, 0, 1)
                 else:
-                    # normalized [-1, 1] -> [0-1]
                     return np.clip(img_tensor * 0.5 + 0.5, 0, 1)
             if img2["instance"] == im:
                 img_tensor = np.array(img2["img"]).astype(np.float32)
@@ -1238,5 +1307,5 @@ def sparse_scene_optimizer(
         confs=confs_list,
         canonical_paths=canonical_paths,
         base_focals=init_focals,
-        sizes=sizes,
+        sizes=mx.exp(log_sizes),
     )

@@ -1,125 +1,20 @@
-"""Scene optimizer for multi-view global alignment.
+"""Scene optimizer for multi-view global alignment - PyTorch-faithful port.
 
-Implements the core optimization loop for sparse global alignment,
-using MLX for automatic differentiation.
-
-Based on the PyTorch MASt3R implementation with:
-- Depth normalization by median for numerical stability
-- Kinematic chain (MST) for pose composition
-- z_cameras reparametrization with sizes
-- depth_mode='add' reconstruction
-- Global scaling protection
+Exact port of PyTorch MASt3R sparse_scene_optimizer.
 
 Copyright (c) 2025 Delanoe Pirard / Aedelon. Apache 2.0 License.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import namedtuple
 from typing import Callable
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 
 from .losses import gamma_loss
 from .schedules import cosine_schedule
-
-
-@dataclass
-class OptimConfig:
-    """Configuration for scene optimization."""
-
-    # Phase 1: Coarse alignment (3D loss)
-    lr1: float = 0.07
-    niter1: int = 300
-
-    # Phase 2: Fine alignment (2D reprojection loss)
-    lr2: float = 0.01
-    niter2: int = 300
-
-    # Loss parameters
-    gamma_coarse: float = 1.5
-    gamma_fine: float = 0.5
-
-    # Optimization targets
-    optimize_depth: bool = True
-    shared_intrinsics: bool = False
-
-    # Constraints
-    min_focal_ratio: float = 0.5
-    max_focal_ratio: float = 2.0
-
-
-def quaternion_to_rotation_matrix(q: mx.array) -> mx.array:
-    """Convert unit quaternion to rotation matrix.
-
-    Args:
-        q: Quaternion [4] as (x, y, z, w)
-
-    Returns:
-        Rotation matrix [3, 3]
-    """
-    x, y, z, w = q[0], q[1], q[2], q[3]
-
-    # Normalize
-    norm = mx.sqrt(x * x + y * y + z * z + w * w + 1e-8)
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-
-    # Build rotation matrix
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-
-    R = mx.array(
-        [
-            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
-            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
-            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
-        ]
-    )
-    return R
-
-
-def rotation_matrix_to_quaternion(R: mx.array) -> mx.array:
-    """Convert rotation matrix to unit quaternion.
-
-    Args:
-        R: Rotation matrix [3, 3]
-
-    Returns:
-        Quaternion [4] as (x, y, z, w)
-    """
-    trace = R[0, 0] + R[1, 1] + R[2, 2]
-
-    if trace > 0:
-        s = 0.5 / mx.sqrt(trace + 1.0)
-        w = 0.25 / s
-        x = (R[2, 1] - R[1, 2]) * s
-        y = (R[0, 2] - R[2, 0]) * s
-        z = (R[1, 0] - R[0, 1]) * s
-    else:
-        # Find largest diagonal element
-        if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = 2.0 * mx.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-            w = (R[2, 1] - R[1, 2]) / s
-            x = 0.25 * s
-            y = (R[0, 1] + R[1, 0]) / s
-            z = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = 2.0 * mx.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-            w = (R[0, 2] - R[2, 0]) / s
-            x = (R[0, 1] + R[1, 0]) / s
-            y = 0.25 * s
-            z = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = 2.0 * mx.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-            w = (R[1, 0] - R[0, 1]) / s
-            x = (R[0, 2] + R[2, 0]) / s
-            y = (R[1, 2] + R[2, 1]) / s
-            z = 0.25 * s
-
-    return mx.array([x, y, z, w])
 
 
 def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[dict[int, int], int]:
@@ -183,691 +78,691 @@ def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[d
     return parent_map, 0
 
 
-def compose_poses_kinematic(
-    quats: mx.array,
-    trans: mx.array,
-    parent_map: dict[int, int],
-    root: int = 0,
-) -> mx.array:
-    """Compose poses hierarchically along the MST.
+# Match PyTorch structure
+PairOfSlices = namedtuple(
+    "ImgPair",
+    "img1, slice1, pix1, anchor_idxs1, img2, slice2, pix2, anchor_idxs2, confs, confs_sum",
+)
 
-    Each camera's world pose is computed relative to its parent.
-    T_world_child = T_world_parent @ T_parent_child
+
+def normalize_quat(q: mx.array) -> mx.array:
+    """Normalize quaternion."""
+    return q / mx.sqrt(mx.sum(q * q, axis=-1, keepdims=True) + 1e-8)
+
+
+def inv_pose(pose: mx.array) -> mx.array:
+    """Invert a 4x4 pose matrix."""
+    R = pose[:3, :3]
+    t = pose[:3, 3]
+    R_inv = R.T
+    t_inv = -R_inv @ t
+    # Build 4x4 matrix directly (MLX doesn't have .at[].set())
+    row0 = mx.concatenate([R_inv[0], t_inv[0:1]])
+    row1 = mx.concatenate([R_inv[1], t_inv[1:2]])
+    row2 = mx.concatenate([R_inv[2], t_inv[2:3]])
+    row3 = mx.array([0.0, 0.0, 0.0, 1.0])
+    return mx.stack([row0, row1, row2, row3])
+
+
+def reproj2d(K: mx.array, w2cam: mx.array, pts3d: mx.array) -> mx.array:
+    """Project 3D world points to 2D image coordinates.
 
     Args:
-        quats: Quaternions [N, 4]
-        trans: Translations [N, 3]
-        parent_map: {child_idx: parent_idx}
-        root: Root node index (identity pose)
+        K: [3, 3] intrinsic matrix
+        w2cam: [4, 4] world-to-camera transform
+        pts3d: [N, 3] 3D points in world coordinates
 
     Returns:
-        World poses [N, 4, 4]
+        [N, 2] projected 2D points
     """
-    n_images = quats.shape[0]
+    # Transform to camera coords
+    pts_cam = pts3d @ w2cam[:3, :3].T + w2cam[:3, 3]
 
-    # Compute local poses (relative to parent)
-    local_poses = []
-    for i in range(n_images):
-        R = quaternion_to_rotation_matrix(quats[i])
-        t = trans[i]
-        row0 = mx.concatenate([R[0], t[0:1]])
-        row1 = mx.concatenate([R[1], t[1:2]])
-        row2 = mx.concatenate([R[2], t[2:3]])
-        row3 = mx.array([0.0, 0.0, 0.0, 1.0])
-        pose = mx.stack([row0, row1, row2, row3], axis=0)
-        local_poses.append(pose)
+    # Project
+    z = mx.maximum(pts_cam[:, 2:3], mx.array(1e-6))
+    uv = pts_cam[:, :2] / z
 
-    # Build world poses by composing along tree
-    # Use topological order (BFS from root)
-    world_poses = [None] * n_images
+    # Apply intrinsics
+    proj = uv * mx.array([K[0, 0], K[1, 1]]) + mx.array([K[0, 2], K[1, 2]])
 
-    # Root has identity as world pose (or its local pose IS world pose)
-    world_poses[root] = local_poses[root]
-
-    # BFS to process in order
-    queue = [root]
-    visited = {root}
-
-    # Build children map
-    children: dict[int, list[int]] = {i: [] for i in range(n_images)}
-    for child, parent in parent_map.items():
-        children[parent].append(child)
-
-    while queue:
-        parent_idx = queue.pop(0)
-        for child_idx in children[parent_idx]:
-            if child_idx not in visited:
-                # T_world_child = T_world_parent @ T_parent_child
-                world_poses[child_idx] = world_poses[parent_idx] @ local_poses[child_idx]
-                visited.add(child_idx)
-                queue.append(child_idx)
-
-    # Handle any unvisited (disconnected) nodes
-    for i in range(n_images):
-        if world_poses[i] is None:
-            world_poses[i] = local_poses[i]
-
-    return mx.stack(world_poses, axis=0)
+    return mx.clip(proj, -1e4, 1e4)
 
 
-class SceneOptimizer(nn.Module):
-    """Optimizable scene parameters for global alignment.
+def proj3d(inv_K: mx.array, pixels: mx.array, z: mx.array) -> mx.array:
+    """Unproject 2D pixels to 3D using inverse intrinsics.
 
-    Uses PyTorch MASt3R-compatible reparametrization:
-    - Depths normalized by median
-    - z_cameras = sizes * median_depths * focals / base_focals
-    - depth = z_cameras + (core_depth_norm - 1) * median_depth * size
-    - Kinematic chain (MST) for pose composition
+    Args:
+        inv_K: [3, 3] inverse intrinsics
+        pixels: [N, 2] pixel coordinates
+        z: [N] depth values
+
+    Returns:
+        [N, 3] 3D points in camera coordinates
     """
+    # Normalized coordinates: (u - cx) / fx, (v - cy) / fy
+    fx, fy = inv_K[0, 0], inv_K[1, 1]
+    cx, cy = inv_K[0, 2], inv_K[1, 2]
 
-    def __init__(
-        self,
-        n_images: int,
-        image_sizes: list[tuple[int, int]],
-        init_focals: mx.array | None = None,
-        init_pps: mx.array | None = None,
-        init_depths: list[mx.array] | None = None,
-        subsample: int = 8,
-        shared_intrinsics: bool = False,
-        mst_edges: dict[int, int] | None = None,
-    ):
-        """Initialize scene optimizer.
+    x_norm = pixels[:, 0] * fx + cx
+    y_norm = pixels[:, 1] * fy + cy
 
-        Args:
-            n_images: Number of images
-            image_sizes: List of (H, W) per image
-            init_focals: Initial focal lengths [N]
-            init_pps: Initial principal points [N, 2]
-            init_depths: Initial depth maps per image
-            subsample: Depth subsampling factor
-            shared_intrinsics: Use single intrinsics for all views
-            mst_edges: MST parent map {child: parent} for kinematic chain
-        """
-        super().__init__()
+    pts3d = mx.stack([x_norm * z, y_norm * z, z], axis=-1)
+    return pts3d
 
-        self.n_images = n_images
-        self.image_sizes = image_sizes
-        self.subsample = subsample
-        self.shared_intrinsics = shared_intrinsics
-        self.mst_edges = mst_edges if mst_edges else {}
 
-        # Initialize rotations as quaternions (x, y, z, w)
-        # First view is identity, others are optimized
-        init_quats = mx.zeros((n_images, 4))
-        init_quats = init_quats.at[:, 3].add(1.0)  # w = 1
-        self.quats = init_quats
+def geotrf(T: mx.array, pts: mx.array) -> mx.array:
+    """Apply geometric transform to points.
 
-        # Initialize translations
-        self.trans = mx.zeros((n_images, 3))
+    Args:
+        T: [4, 4] transformation matrix
+        pts: [N, 3] points
 
-        # Initialize focal lengths
-        if init_focals is None:
-            init_focals = mx.array([float(max(h, w)) for h, w in image_sizes])
+    Returns:
+        [N, 3] transformed points
+    """
+    return pts @ T[:3, :3].T + T[:3, 3]
+
+
+def adam_step(
+    params: dict,
+    grads: dict,
+    m: dict,
+    v: dict,
+    step: int,
+    lr: float,
+    beta1: float = 0.9,
+    beta2: float = 0.9,
+    eps: float = 1e-8,
+):
+    """Adam optimizer step, modifies params in-place."""
+    for key in params:
+        if key not in grads or grads[key] is None:
+            continue
+
+        g = grads[key]
+
+        # Update biased first moment estimate
+        m[key] = beta1 * m[key] + (1 - beta1) * g
+        # Update biased second moment estimate
+        v[key] = beta2 * v[key] + (1 - beta2) * (g * g)
+
+        # Bias correction
+        m_hat = m[key] / (1 - beta1 ** (step + 1))
+        v_hat = v[key] / (1 - beta2 ** (step + 1))
+
+        # Update
+        params[key] = params[key] - lr * m_hat / (mx.sqrt(v_hat) + eps)
+
+
+def sparse_scene_optimizer(
+    imgs: list[str],
+    imsizes: list[tuple[int, int]],  # [(H, W), ...] image sizes
+    pps: list[mx.array],  # Principal points [N, 2]
+    base_focals: mx.array,  # [N] initial focal estimates
+    core_depth: list[mx.array],  # Subsampled normalized depth maps
+    median_depths: mx.array,  # [N] median depths for normalization
+    img_anchors: dict,  # {idx: (uv, idxs, offsets)} anchor data
+    corres: list[dict],  # [{idx1, idx2, pts1_idx, pts2_idx, weights}, ...]
+    preds_21: dict,  # Cross-predictions for dust3r loss
+    mst: tuple,  # (root, edges) minimum spanning tree
+    subsample: int = 8,
+    lr1: float = 0.07,
+    niter1: int = 300,
+    lr2: float = 0.01,  # PyTorch default
+    niter2: int = 300,
+    loss1_fn: Callable = None,
+    loss2_fn: Callable = None,
+    lossd_fn: Callable = None,
+    exp_depth: bool = True,
+    shared_intrinsics: bool = False,
+    matching_conf_thr: float = 5.0,
+    loss_dust3r_w: float = 0.01,
+    verbose: bool = True,
+):
+    """PyTorch-faithful sparse scene optimizer.
+
+    This is an exact port of PyTorch MASt3R sparse_scene_optimizer.
+    """
+    if loss1_fn is None:
+        loss1_fn = gamma_loss(1.5)  # Phase 1: 3D loss (PyTorch default)
+    if loss2_fn is None:
+        loss2_fn = gamma_loss(0.5)  # Phase 2: 2D loss
+    if lossd_fn is None:
+        lossd_fn = gamma_loss(1.1)  # DUSt3R loss
+
+    n_imgs = len(imgs)
+
+    # Convert imsizes to (H, W) tuples if needed
+    imsizes_hw = []
+    for sz in imsizes:
+        if isinstance(sz, tuple):
+            imsizes_hw.append(sz)
         else:
-            init_focals = (
-                mx.array(init_focals) if not isinstance(init_focals, mx.array) else init_focals
-            )
+            imsizes_hw.append((int(sz[0]), int(sz[1])))
 
-        # Base focals (fixed, for reparametrization)
-        self.base_focals = init_focals
+    # Compute image diagonals for focal constraints
+    diags = mx.array([np.sqrt(H**2 + W**2) for H, W in imsizes_hw])
+    min_focals = 0.25 * diags
+    max_focals = 10.0 * diags
 
-        # Log-focal lengths (optimizable)
-        self.log_focals = mx.log(init_focals)
+    # === Initialize parameters exactly like PyTorch ===
 
-        # Initialize principal points (normalized to [0, 1])
-        if init_pps is None:
-            init_pps = mx.array([[0.5, 0.5]] * n_images)
-        self.pps = init_pps
+    # Quaternions (identity rotation: [0, 0, 0, 1])
+    quats = mx.stack([mx.array([0.0, 0.0, 0.0, 1.0]) for _ in range(n_imgs)])
 
-        # Sizes (replaces log_scales) - optimizable scale per view
-        self.sizes = mx.ones(n_images)
+    # Translations (zero)
+    trans = mx.stack([mx.zeros(3) for _ in range(n_imgs)])
 
-        # Initialize depths with median normalization
-        self.median_depths: list[mx.array] = []
-        self.core_depths: list[mx.array] | None = None
+    # Principal points normalized by image size
+    pps_norm = mx.stack(
+        [
+            pp / mx.array([float(imsizes_hw[i][1]), float(imsizes_hw[i][0])])
+            for i, pp in enumerate(pps)
+        ]
+    )
 
-        if init_depths is not None:
-            self.core_depths = []
-            for depth in init_depths:
-                d_flat = depth.flatten()
-                # Compute median for normalization
-                median = mx.median(d_flat)
-                median = mx.maximum(median, mx.array(1e-6))  # Prevent div by zero
-                self.median_depths.append(median)
-                # Normalize depth by median
-                d_normalized = d_flat / median
-                self.core_depths.append(d_normalized)
-        else:
-            # Default median depths if no init
-            self.median_depths = [mx.array(1.0) for _ in range(n_images)]
+    # Log focals
+    log_focals = mx.log(base_focals)
 
-    def get_global_scaling(self) -> mx.array:
-        """Get global scaling factor to prevent scale collapse.
+    # Log sizes (scale factors)
+    log_sizes = mx.zeros(n_imgs)
 
-        Returns:
-            Scalar scaling factor = 1 / min(sizes)
-        """
-        min_size = mx.minimum(self.sizes.min(), mx.array(1.0))
-        return 1.0 / mx.maximum(min_size, mx.array(1e-6))
+    # Depth parameters
+    if exp_depth:
+        core_depth_params = mx.concatenate(
+            [mx.log(mx.maximum(d.reshape(-1), mx.array(1e-4))) for d in core_depth]
+        )
+    else:
+        core_depth_params = mx.concatenate([d.reshape(-1) for d in core_depth])
 
-    def get_z_cameras(self) -> mx.array:
-        """Compute z_cameras for each view.
+    # Track depth boundaries for each image
+    depth_bounds = []
+    offset = 0
+    for i, d in enumerate(core_depth):
+        n = d.size
+        depth_bounds.append((offset, offset + n))
+        offset += n
 
-        z_cameras = sizes * median_depths * focals / base_focals
+    # === Build helper functions ===
 
-        Returns:
-            z_cameras [N]
-        """
-        focals = self.get_focals()
-        z_cameras = []
-        for i in range(self.n_images):
-            z = self.sizes[i] * self.median_depths[i] * focals[i] / self.base_focals[i]
-            z_cameras.append(z)
-        return mx.stack(z_cameras)
+    def make_K_cam_depth(log_focals, pps_norm, trans, quats, log_sizes, core_depth_params):
+        """Build intrinsics, poses, and depthmaps exactly like PyTorch."""
+        # Clamp focals
+        focals = mx.clip(mx.exp(log_focals), min_focals, max_focals)
 
-    def get_poses(self) -> mx.array:
-        """Get camera-to-world transformation matrices.
-
-        Uses kinematic chain (MST) if available, otherwise independent poses.
-        Applies global scaling to translations.
-
-        Returns:
-            Camera poses [N, 4, 4]
-        """
-        if self.mst_edges:
-            poses = compose_poses_kinematic(self.quats, self.trans, self.mst_edges, root=0)
-        else:
-            # Independent poses (fallback)
-            poses = []
-            for i in range(self.n_images):
-                R = quaternion_to_rotation_matrix(self.quats[i])
-                t = self.trans[i]
-                row0 = mx.concatenate([R[0], t[0:1]])
-                row1 = mx.concatenate([R[1], t[1:2]])
-                row2 = mx.concatenate([R[2], t[2:3]])
-                row3 = mx.array([0.0, 0.0, 0.0, 1.0])
-                pose = mx.stack([row0, row1, row2, row3], axis=0)
-                poses.append(pose)
-            poses = mx.stack(poses, axis=0)
-
-        # Apply global scaling to translations
-        scaling = self.get_global_scaling()
-        # Scale translations only
-        scaled_poses = []
-        for i in range(self.n_images):
-            pose = poses[i]
-            # Scale translation part
-            t_scaled = pose[:3, 3] * scaling
-            row0 = mx.concatenate([pose[0, :3], t_scaled[0:1]])
-            row1 = mx.concatenate([pose[1, :3], t_scaled[1:2]])
-            row2 = mx.concatenate([pose[2, :3], t_scaled[2:3]])
-            row3 = pose[3]
-            scaled_poses.append(mx.stack([row0, row1, row2, row3], axis=0))
-
-        return mx.stack(scaled_poses, axis=0)
-
-    def get_focals(self) -> mx.array:
-        """Get focal lengths.
-
-        Returns:
-            Focal lengths [N]
-        """
-        if self.shared_intrinsics:
-            return mx.exp(self.log_focals[0:1]).broadcast_to((self.n_images,))
-        return mx.exp(self.log_focals)
-
-    def get_principal_points(self) -> mx.array:
-        """Get principal points in pixel coordinates.
-
-        Returns:
-            Principal points [N, 2]
-        """
-        pps_pixel = []
-        for i in range(self.n_images):
-            H, W = self.image_sizes[i]
-            if self.shared_intrinsics:
-                pp = self.pps[0]
-            else:
-                pp = self.pps[i]
-            pps_pixel.append(mx.array([pp[0] * W, pp[1] * H]))
-        return mx.stack(pps_pixel, axis=0)
-
-    def get_intrinsics(self) -> mx.array:
-        """Get camera intrinsic matrices.
-
-        Returns:
-            Intrinsics [N, 3, 3]
-        """
-        focals = self.get_focals()
-        pps = self.get_principal_points()
-
-        Ks = []
-        for i in range(self.n_images):
-            K = mx.array(
+        # Build intrinsic matrices
+        K_list = []
+        for i in range(n_imgs):
+            H, W = imsizes_hw[i]
+            Ki = mx.array(
                 [
-                    [focals[i], 0, pps[i, 0]],
-                    [0, focals[i], pps[i, 1]],
-                    [0, 0, 1],
+                    [focals[i], 0.0, pps_norm[i, 0] * W],
+                    [0.0, focals[i], pps_norm[i, 1] * H],
+                    [0.0, 0.0, 1.0],
                 ]
             )
-            Ks.append(K)
-        return mx.stack(Ks, axis=0)
+            K_list.append(Ki)
+        K = mx.stack(K_list)
 
-    def get_depths(self) -> list[mx.array] | None:
-        """Get depth maps using depth_mode='add' reconstruction.
+        # Sizes and global scaling (security against scale collapse)
+        sizes = mx.exp(log_sizes)
+        global_scaling = 1.0 / mx.minimum(mx.min(sizes), mx.array(1.0))
 
-        depth = z_cameras + (core_depth_norm - 1) * median_depth * size
+        # z_cameras: reparametrization like PyTorch
+        z_cameras = sizes * median_depths * focals / base_focals
 
-        Applies global scaling for consistency.
+        # Build rotation matrices from quaternions
+        quats_norm = quats / mx.sqrt(mx.sum(quats**2, axis=-1, keepdims=True) + 1e-8)
 
-        Returns:
-            List of depth maps per image, or None if no depths
-        """
-        if self.core_depths is None:
-            return None
+        def quat_to_pose(q, t):
+            """Convert quaternion and translation to 4x4 pose matrix."""
+            x, y, z, w = q[0], q[1], q[2], q[3]
+            # Build 4x4 matrix directly
+            row0 = mx.array([1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y), t[0]])
+            row1 = mx.array([2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x), t[1]])
+            row2 = mx.array([2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y), t[2]])
+            row3 = mx.array([0.0, 0.0, 0.0, 1.0])
+            return mx.stack([row0, row1, row2, row3])
 
-        z_cameras = self.get_z_cameras()
-        global_scaling = self.get_global_scaling()
+        # Build relative poses
+        rel_cam2cam = []
+        for i in range(n_imgs):
+            T = quat_to_pose(quats_norm[i], trans[i])
+            rel_cam2cam.append(T)
 
-        depths = []
-        for i in range(self.n_images):
-            H, W = self.image_sizes[i]
-            H_sub = (H + self.subsample - 1) // self.subsample
-            W_sub = (W + self.subsample - 1) // self.subsample
+        # Compose poses along MST (kinematic chain)
+        root, edges = mst
+        tmp_cam2w = [None] * n_imgs
+        tmp_cam2w[root] = rel_cam2cam[root]
+        for parent, child in edges:
+            tmp_cam2w[child] = tmp_cam2w[parent] @ rel_cam2cam[child]
 
-            # Reshape normalized core depth
-            core_norm = self.core_depths[i].reshape(H_sub, W_sub)
+        tmp_cam2w = mx.stack(tmp_cam2w)
 
-            # depth_mode='add': depth = z_cameras + (core_norm - 1) * median * size
-            depth_sub = z_cameras[i] + (core_norm - 1.0) * self.median_depths[i] * self.sizes[i]
+        # Smart reparametrization of camera translations (like PyTorch)
+        trans_offset_list = []
+        for i in range(n_imgs):
+            H, W = imsizes_hw[i]
+            offset_xy = mx.array([W, H]) / focals[i] * (0.5 - pps_norm[i])
+            offset = z_cameras[i] * mx.concatenate([offset_xy, mx.ones(1)])
+            trans_offset_list.append(offset)
+        trans_offset = mx.stack(trans_offset_list)
 
-            # Apply global scaling
-            depth_sub = depth_sub * global_scaling
-
-            # Upsample (nearest neighbor)
-            d_full = mx.repeat(mx.repeat(depth_sub, self.subsample, axis=0), self.subsample, axis=1)
-            d_full = d_full[:H, :W]
-            depths.append(d_full)
-
-        return depths
-
-    def get_original_depths(self) -> list[mx.array] | None:
-        """Get original (unoptimized) depth maps.
-
-        Reconstructs from normalized core depths using median.
-
-        Returns:
-            List of original depth maps per image
-        """
-        if self.core_depths is None:
-            return None
-
-        depths = []
-        for i in range(self.n_images):
-            H, W = self.image_sizes[i]
-            H_sub = (H + self.subsample - 1) // self.subsample
-            W_sub = (W + self.subsample - 1) // self.subsample
-
-            # Denormalize: original = normalized * median
-            core_norm = self.core_depths[i].reshape(H_sub, W_sub)
-            depth_sub = core_norm * self.median_depths[i]
-
-            # Upsample
-            d_full = mx.repeat(mx.repeat(depth_sub, self.subsample, axis=0), self.subsample, axis=1)
-            d_full = d_full[:H, :W]
-            depths.append(d_full)
-
-        return depths
-
-
-def make_pts3d_from_depth(
-    optimizer: SceneOptimizer,
-    anchor_data: dict | None = None,
-) -> list[mx.array]:
-    """Reconstruct 3D points from optimized depth maps.
-
-    Matches PyTorch MASt3R make_pts3d function:
-    - Uses depth_mode='add' reconstruction
-    - Reconstructs full grid of 3D points (for indexing with pts_idx)
-    - Transforms to world coordinates
-
-    Args:
-        optimizer: Scene optimizer with current parameters
-        anchor_data: Optional dict for anchor-based reconstruction (not used in grid mode)
-
-    Returns:
-        List of 3D points per image in world coordinates [N, H_sub * W_sub, 3]
-    """
-    poses = optimizer.get_poses()
-    focals = optimizer.get_focals()
-    pps = optimizer.get_principal_points()
-    z_cameras = optimizer.get_z_cameras()
-    global_scaling = optimizer.get_global_scaling()
-
-    all_pts3d = []
-
-    for i in range(optimizer.n_images):
-        H, W = optimizer.image_sizes[i]
-        H_sub = (H + optimizer.subsample - 1) // optimizer.subsample
-        W_sub = (W + optimizer.subsample - 1) // optimizer.subsample
-
-        # Core depth (normalized) - flatten to 1D
-        core_depth = optimizer.core_depths[i].reshape(H_sub * W_sub)
-
-        # depth_mode='add': depth = z_cameras + (core_depth - 1) * median * size
-        depth = (
-            z_cameras[i] + (core_depth - 1.0) * optimizer.median_depths[i] * optimizer.sizes[i]
+        new_trans = global_scaling * (
+            tmp_cam2w[:, :3, 3] - mx.sum(tmp_cam2w[:, :3, :3] * trans_offset[:, None, :], axis=-1)
         )
 
-        # Apply global scaling
-        depth = depth * global_scaling
+        # Build final cam2w matrices
+        bottom = mx.broadcast_to(mx.array([[0.0, 0.0, 0.0, 1.0]]), (n_imgs, 1, 4))
+        cam2w = mx.concatenate(
+            [mx.concatenate([tmp_cam2w[:, :3, :3], new_trans[:, :, None]], axis=2), bottom], axis=1
+        )
 
-        # Create pixel grid for subsampled positions
-        # Match PyTorch: centers are at subsample//2, subsample//2 + subsample, etc.
-        ys = mx.arange(H_sub) * optimizer.subsample + optimizer.subsample // 2
-        xs = mx.arange(W_sub) * optimizer.subsample + optimizer.subsample // 2
-        grid_y, grid_x = mx.meshgrid(ys, xs, indexing="ij")
-        pixels = mx.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1).astype(mx.float32)
+        # Compute depthmaps with depth_mode='add'
+        depthmaps = []
+        for i in range(n_imgs):
+            start, end = depth_bounds[i]
+            cd = core_depth_params[start:end]
+            if exp_depth:
+                cd = mx.exp(cd)
+            # depth_mode='add': depth = z_cameras + (cd - 1) * median * size
+            depth = z_cameras[i] + (cd - 1.0) * (median_depths[i] * sizes[i])
+            depthmaps.append(global_scaling * depth)
 
-        # Unproject to 3D (in camera coordinates)
-        fx = focals[i]
-        fy = focals[i]
-        cx = pps[i, 0]
-        cy = pps[i, 1]
+        return K, cam2w, depthmaps, focals
 
-        x_norm = (pixels[:, 0] - cx) / fx
-        y_norm = (pixels[:, 1] - cy) / fy
+    def make_pts3d(K, cam2w, depthmaps, focals):
+        """Build 3D points at anchor positions with focal-compensated depth offsets.
 
-        pts3d_cam = mx.stack([x_norm * depth, y_norm * depth, depth], axis=-1)
+        PyTorch-faithful implementation:
+            offsets = 1 + (offsets - 1) * (base_focals[img] / focals[img])
+            depth_at_anchor = depthmaps[img][idxs] * offsets
+            pts3d = unproject(pixels, depth_at_anchor)
+        """
+        all_pts3d = {}
 
-        # Transform to world coordinates
-        R = poses[i, :3, :3]
-        t = poses[i, :3, 3]
-        pts3d_world = pts3d_cam @ R.T + t
+        for img_idx in range(n_imgs):
+            H, W = imsizes_hw[img_idx]
+            H_sub = (H + subsample - 1) // subsample
+            W_sub = (W + subsample - 1) // subsample
 
-        all_pts3d.append(pts3d_world)
+            # Get flat depth (already transformed with z_cameras + (cd-1)*median*size)
+            depth_flat = depthmaps[img_idx]
 
-    return all_pts3d
+            # Check if we have anchor data for this image
+            if img_idx in img_anchors:
+                pixels, idxs, offsets = img_anchors[img_idx]
 
+                # Focal compensation (PyTorch formula)
+                focal_ratio = base_focals[img_idx] / focals[img_idx]
+                offsets_compensated = 1.0 + (offsets - 1.0) * focal_ratio
 
-def compute_3d_loss(
-    optimizer: SceneOptimizer,
-    corres: list[dict],
-    canonical_pts3d: list[mx.array],
-    loss_fn: Callable,
-    anchor_data: dict | None = None,
-) -> mx.array:
-    """Compute 3D point matching loss.
+                # Get depth at anchor indices and apply offset (PyTorch formula)
+                idxs_clipped = mx.clip(idxs.astype(mx.int32), 0, len(depth_flat) - 1)
+                depth_at_anchors = depth_flat[idxs_clipped] * offsets_compensated
 
-    Matches PyTorch MASt3R loss_3d function:
-    - Reconstructs 3D points from optimized depth maps
-    - Compares corresponding points in world coordinates
-    - Weights by correspondence confidence
+                # Unproject to 3D camera coordinates
+                fx, fy = K[img_idx, 0, 0], K[img_idx, 1, 1]
+                cx, cy = K[img_idx, 0, 2], K[img_idx, 1, 2]
 
-    Args:
-        optimizer: Scene optimizer with current parameters
-        corres: List of correspondences between image pairs
-        canonical_pts3d: Canonical 3D points per image (used if anchor_data is None)
-        loss_fn: Loss function to use
-        anchor_data: Optional anchor data for precise 3D reconstruction
+                x_norm = (pixels[:, 0] - cx) / fx
+                y_norm = (pixels[:, 1] - cy) / fy
+                pts_cam = mx.stack([
+                    x_norm * depth_at_anchors,
+                    y_norm * depth_at_anchors,
+                    depth_at_anchors,
+                ], axis=-1)
 
-    Returns:
-        Scalar loss value
-    """
-    # Reconstruct 3D points from depth maps if anchor_data is provided
-    if anchor_data is not None:
-        pts3d = make_pts3d_from_depth(optimizer, anchor_data)
-    else:
-        # Fallback: use canonical pts3d with simple scaling (less accurate)
-        poses = optimizer.get_poses()
-        global_scaling = optimizer.get_global_scaling()
+                # Transform to world coordinates
+                pts3d_world = geotrf(cam2w[img_idx], pts_cam)
+                all_pts3d[img_idx] = pts3d_world
+            else:
+                # Fallback: reconstruct on regular grid (for visualization)
+                ys = mx.arange(H_sub) * subsample + subsample // 2
+                xs = mx.arange(W_sub) * subsample + subsample // 2
+                yy, xx = mx.meshgrid(ys, xs, indexing="ij")
+                pixels = mx.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1).astype(mx.float32)
 
-        pts3d = []
-        for i in range(optimizer.n_images):
-            pts_local = canonical_pts3d[i] * optimizer.sizes[i] * global_scaling
-            R = poses[i, :3, :3]
-            t = poses[i, :3, 3]
-            pts_world = pts_local @ R.T + t
-            pts3d.append(pts_world)
+                fx, fy = K[img_idx, 0, 0], K[img_idx, 1, 1]
+                cx, cy = K[img_idx, 0, 2], K[img_idx, 1, 2]
 
-    # Compute loss over all correspondences
-    all_pts1 = []
-    all_pts2 = []
-    all_weights = []
+                x_norm = (pixels[:, 0] - cx) / fx
+                y_norm = (pixels[:, 1] - cy) / fy
+                pts_cam = mx.stack([x_norm * depth_flat, y_norm * depth_flat, depth_flat], axis=-1)
 
+                pts3d_world = geotrf(cam2w[img_idx], pts_cam)
+                all_pts3d[img_idx] = pts3d_world
+
+        return all_pts3d
+
+    def compute_loss_3d(K, cam2w, pts3d, loss_fn):
+        """3D matching loss between corresponding points (PyTorch-faithful).
+
+        Uses slices into anchor-aggregated pts3d, like PyTorch MASt3R loss_3d.
+        Only uses correspondences where max_conf > matching_conf_thr (like PyTorch).
+        """
+        if not corres:
+            return mx.array(0.0)
+
+        total_loss = mx.array(0.0)
+        total_weight = mx.array(0.0)
+
+        for c in corres:
+            # Filter by matching confidence (like PyTorch is_matching_ok)
+            max_conf = c.get("max_conf", float("inf"))
+            if max_conf <= matching_conf_thr:
+                continue
+
+            idx1, idx2 = c["idx1"], c["idx2"]
+            slice1 = c["slice1"]  # Slice into pts3d[idx1]
+            slice2 = c["slice2"]  # Slice into pts3d[idx2]
+            weights = c["weights"]
+
+            if idx1 not in pts3d or idx2 not in pts3d:
+                continue
+
+            # Get 3D points using slices (like PyTorch)
+            p1 = pts3d[idx1][slice1]
+            p2 = pts3d[idx2][slice2]
+
+            # Ensure same length (correspondences should match)
+            n = min(len(p1), len(p2), len(weights))
+            if n == 0:
+                continue
+            p1 = p1[:n]
+            p2 = p2[:n]
+            w = weights[:n]
+
+            # Compute weighted loss
+            dist = loss_fn(p1, p2)
+            total_loss = total_loss + mx.sum(w * dist)
+            total_weight = total_weight + mx.sum(w)
+
+        return total_loss / mx.maximum(total_weight, mx.array(1e-8))
+
+    def compute_loss_2d(K, cam2w, pts3d, loss_fn):
+        """2D reprojection loss (PyTorch-faithful).
+
+        For each correspondence, reproject 3D points from one image to
+        the other and compute 2D pixel distance.
+        Only uses correspondences where max_conf > matching_conf_thr (like PyTorch).
+        """
+        if not corres:
+            return mx.array(0.0)
+
+        total_loss = mx.array(0.0)
+        total_weight = mx.array(0.0)
+
+        for c in corres:
+            # Filter by matching confidence (like PyTorch is_matching_ok)
+            max_conf = c.get("max_conf", float("inf"))
+            if max_conf <= matching_conf_thr:
+                continue
+
+            idx1, idx2 = c["idx1"], c["idx2"]
+            slice1 = c["slice1"]  # Slice into pts3d[idx1]
+            slice2 = c["slice2"]  # Slice into pts3d[idx2]
+            pts1 = c["pts1"]  # 2D pixel coords in img1
+            pts2 = c["pts2"]  # 2D pixel coords in img2
+            weights = c["weights"]
+
+            if idx1 not in pts3d or idx2 not in pts3d:
+                continue
+
+            # Get 3D points using slices
+            p1_3d = pts3d[idx1][slice1]  # 3D points from img1
+            p2_3d = pts3d[idx2][slice2]  # 3D points from img2
+
+            # Ensure same length
+            n = min(len(p1_3d), len(p2_3d), len(pts1), len(pts2), len(weights))
+            if n == 0:
+                continue
+
+            p1_3d = p1_3d[:n]
+            p2_3d = p2_3d[:n]
+            pix1 = pts1[:n]
+            pix2 = pts2[:n]
+            w = weights[:n]
+
+            # Project p2_3d to img1 (PyTorch-style: single direction)
+            w2cam1 = inv_pose(cam2w[idx1])
+            proj_to_1 = reproj2d(K[idx1], w2cam1, p2_3d)
+
+            # Single direction 2D loss (matches PyTorch)
+            dist1 = loss_fn(pix1, proj_to_1)
+
+            total_loss = total_loss + mx.sum(w * dist1)
+            total_weight = total_weight + mx.sum(w)
+
+        return total_loss / mx.maximum(total_weight, mx.array(1e-8))
+
+    # Build set of low-confidence pairs (for dust3r loss filtering)
+    # PyTorch only applies loss_dust3r to pairs where is_matching_ok is False
+    low_conf_pairs = set()
     for c in corres:
-        idx1, idx2 = c["idx1"], c["idx2"]
-        pts1_idx = c["pts1_idx"]
-        pts2_idx = c["pts2_idx"]
-        weights = c.get("weights", None)
+        max_conf = c.get("max_conf", float("inf"))
+        if max_conf <= matching_conf_thr:
+            low_conf_pairs.add((c["idx1"], c["idx2"]))
+            low_conf_pairs.add((c["idx2"], c["idx1"]))  # Both directions
 
-        # Get corresponding 3D points
-        pts1 = pts3d[idx1][pts1_idx]
-        pts2 = pts3d[idx2][pts2_idx]
+    def compute_loss_dust3r(cam2w, pts3d, loss_fn):
+        """DUSt3R loss using cross-predictions (only for low-confidence pairs).
 
-        all_pts1.append(pts1)
-        all_pts2.append(pts2)
-        if weights is not None:
-            all_weights.append(weights)
+        PyTorch-faithful: Only applies to pairs in dust3r_slices (low confidence).
+        """
+        if not preds_21:
+            return mx.array(0.0)
 
-    if not all_pts1:
-        return mx.array(0.0)
+        total_loss = mx.array(0.0)
+        total_conf = mx.array(0.0)
 
-    # Concatenate all correspondences
-    pts1_cat = mx.concatenate(all_pts1, axis=0)
-    pts2_cat = mx.concatenate(all_pts2, axis=0)
+        for img1_path, preds_from_img1 in preds_21.items():
+            try:
+                idx1 = imgs.index(img1_path)
+            except ValueError:
+                continue
 
-    if all_weights:
-        weights_cat = mx.concatenate(all_weights, axis=0)
-        # Weighted loss: sum(weights * loss) / sum(weights)
-        point_losses = loss_fn(pts1_cat, pts2_cat, None)
-        total_loss = mx.sum(weights_cat * point_losses)
-        return total_loss / mx.sum(weights_cat)
-    else:
-        return loss_fn(pts1_cat, pts2_cat, None)
+            for img2_path, (tgt_pts, tgt_confs) in preds_from_img1.items():
+                try:
+                    idx2 = imgs.index(img2_path)
+                except ValueError:
+                    continue
 
+                # PyTorch-faithful: Only apply to low-confidence pairs
+                if (idx1, idx2) not in low_conf_pairs:
+                    continue
 
-def compute_2d_loss(
-    optimizer: SceneOptimizer,
-    corres: list[dict],
-    loss_fn: Callable,
-) -> mx.array:
-    """Compute 2D reprojection loss.
+                if idx1 not in pts3d:
+                    continue
 
-    Args:
-        optimizer: Scene optimizer with current parameters
-        corres: List of correspondences between image pairs
-        loss_fn: Loss function to use
+                # Get reconstructed pts3d for idx1
+                pts3d_1 = pts3d[idx1]
 
-    Returns:
-        Scalar loss value
-    """
-    poses = optimizer.get_poses()
-    Ks = optimizer.get_intrinsics()
-    depths = optimizer.get_depths()
+                # Transform target predictions to world coords
+                tgt_pts_world = geotrf(cam2w[idx2], tgt_pts)
 
-    if depths is None:
-        return mx.array(0.0)
+                # Match sizes
+                n_pts = min(pts3d_1.shape[0], tgt_pts_world.shape[0], tgt_confs.shape[0])
+                if n_pts == 0:
+                    continue
 
-    total_loss = mx.array(0.0)
-    n_pairs = 0
+                p1 = pts3d_1[:n_pts]
+                p2 = tgt_pts_world[:n_pts]
+                cf = tgt_confs[:n_pts]
 
-    for c in corres:
-        idx1, idx2 = c["idx1"], c["idx2"]
-        pts1_px = c["pts1"]  # Pixel coordinates [N, 2]
-        pts2_px = c["pts2"]
-        weights = c.get("weights", None)
+                dist = loss_fn(p1, p2)
+                total_loss = total_loss + mx.sum(cf * dist)
+                total_conf = total_conf + mx.sum(cf)
 
-        # Get depths at correspondence locations
-        d1 = depths[idx1]
-        d2 = depths[idx2]
+        return total_loss / mx.maximum(total_conf, mx.array(1e-8))
 
-        # Unproject pts1 to 3D
-        K1 = Ks[idx1]
-        fx1, fy1 = K1[0, 0], K1[1, 1]
-        cx1, cy1 = K1[0, 2], K1[1, 2]
+    # === Phase 1: Coarse alignment (3D loss) ===
+    # IMPORTANT: PyTorch does NOT optimize focals or depths in Phase 1
+    # Only quats, trans, and log_sizes are trainable
 
-        x1_norm = (pts1_px[:, 0] - cx1) / fx1
-        y1_norm = (pts1_px[:, 1] - cy1) / fy1
-
-        # Sample depths (nearest neighbor)
-        pts1_int = pts1_px.astype(mx.int32)
-        pts1_int = mx.clip(pts1_int, 0, mx.array([d1.shape[1] - 1, d1.shape[0] - 1]))
-        z1 = d1[pts1_int[:, 1], pts1_int[:, 0]]
-
-        pts3d_cam1 = mx.stack([x1_norm * z1, y1_norm * z1, z1], axis=-1)
-
-        # Transform to world then to camera 2
-        T1 = poses[idx1]
-        T2 = poses[idx2]
-
-        # Compute inverse of T2
-        R2 = T2[:3, :3]
-        t2 = T2[:3, 3]
-        R2_T = R2.T
-        t2_inv = -(R2_T @ t2)
-
-        pts3d_world = pts3d_cam1 @ T1[:3, :3].T + T1[:3, 3]
-        pts3d_cam2 = pts3d_world @ R2_T.T + t2_inv
-
-        # Project to camera 2
-        K2 = Ks[idx2]
-        fx2, fy2 = K2[0, 0], K2[1, 1]
-        cx2, cy2 = K2[0, 2], K2[1, 2]
-
-        z2 = mx.maximum(pts3d_cam2[:, 2], mx.array(1e-6))
-        x2_proj = pts3d_cam2[:, 0] / z2 * fx2 + cx2
-        y2_proj = pts3d_cam2[:, 1] / z2 * fy2 + cy2
-
-        pts2_proj = mx.stack([x2_proj, y2_proj], axis=-1)
-
-        # Compute reprojection error
-        loss = loss_fn(pts2_proj, pts2_px, weights)
-        total_loss = total_loss + loss
-        n_pairs += 1
-
-    return total_loss / max(n_pairs, 1)
-
-
-def optimize_scene(
-    optimizer: SceneOptimizer,
-    corres: list[dict],
-    canonical_pts3d: list[mx.array],
-    config: OptimConfig | None = None,
-    anchor_data: dict | None = None,
-    verbose: bool = True,
-) -> SceneOptimizer:
-    """Run two-phase scene optimization.
-
-    Phase 1: Optimize poses and sizes using 3D loss
-    Phase 2: Refine with 2D reprojection loss
-
-    Args:
-        optimizer: Initial scene optimizer
-        corres: Correspondences between views
-        canonical_pts3d: Canonical 3D points per view
-        config: Optimization configuration
-        anchor_data: Optional anchor data for precise 3D reconstruction
-                    Dict mapping img_idx to (pixels, idxs, offsets)
-        verbose: Print progress
-
-    Returns:
-        Optimized scene
-    """
-    if config is None:
-        config = OptimConfig()
-
-    loss_3d = gamma_loss(config.gamma_coarse)
-    loss_2d = gamma_loss(config.gamma_fine)
-
-    # Phase 1: Coarse alignment
     if verbose:
-        print(f"Phase 1: Coarse alignment ({config.niter1} iterations)")
+        print(f"Phase 1: Coarse alignment ({niter1} iterations, lr={lr1})")
 
-    def loss_fn_phase1(params):
-        optimizer.quats = params["quats"]
-        optimizer.trans = params["trans"]
-        optimizer.sizes = params["sizes"]
-        return compute_3d_loss(optimizer, corres, canonical_pts3d, loss_3d, anchor_data)
+    # Parameters for Phase 1: ONLY poses and sizes (like PyTorch)
+    # log_focals and core_depth are FROZEN
+    params_p1 = {
+        "trans": trans,
+        "quats": quats,
+        "log_sizes": log_sizes,
+    }
 
-    for step in range(config.niter1):
-        lr = cosine_schedule(step / max(config.niter1 - 1, 1), config.lr1, config.lr1 * 0.1)
+    # Frozen parameters (not optimized)
+    frozen_log_focals = log_focals
+    frozen_core_depth = core_depth_params
 
-        params = {
-            "quats": optimizer.quats,
-            "trans": optimizer.trans,
-            "sizes": optimizer.sizes,
+    # Adam moments
+    m_p1 = {k: mx.zeros_like(v) for k, v in params_p1.items()}
+    v_p1 = {k: mx.zeros_like(v) for k, v in params_p1.items()}
+
+    def loss_phase1(trans, quats, log_sizes):
+        """Total loss for Phase 1 (focals and depths are frozen)."""
+        K, cam2w, depthmaps, focals = make_K_cam_depth(
+            frozen_log_focals, pps_norm, trans, quats, log_sizes, frozen_core_depth
+        )
+        pts3d = make_pts3d(K, cam2w, depthmaps, focals)
+
+        loss_3d = compute_loss_3d(K, cam2w, pts3d, loss1_fn)
+        loss_d = compute_loss_dust3r(cam2w, pts3d, lossd_fn)
+
+        return loss_3d + loss_dust3r_w * loss_d
+
+    # Optimization loop Phase 1
+    for step in range(niter1):
+        alpha = step / max(niter1 - 1, 1)
+        lr = cosine_schedule(alpha, lr1, 0)  # PyTorch uses lr_end=0
+
+        # Compute loss and gradients (only for trainable params)
+        loss_val, grads = mx.value_and_grad(loss_phase1, argnums=(0, 1, 2))(
+            params_p1["trans"],
+            params_p1["quats"],
+            params_p1["log_sizes"],
+        )
+
+        grad_dict = {
+            "trans": grads[0],
+            "quats": grads[1],
+            "log_sizes": grads[2],
         }
 
-        loss, grads = mx.value_and_grad(loss_fn_phase1)(params)
+        # Adam update
+        adam_step(params_p1, grad_dict, m_p1, v_p1, step, lr, beta1=0.9, beta2=0.9)
 
-        # Clip gradients for stability
-        def clip_grad(g, max_norm=1.0):
-            norm = mx.sqrt(mx.sum(g**2) + 1e-8)
-            scale = mx.minimum(max_norm / norm, mx.array(1.0))
-            return g * scale
+        # Normalize quaternions after each step (like PyTorch)
+        # This ensures quats remain valid rotation representations
+        quats_normalized = params_p1["quats"] / mx.sqrt(
+            mx.sum(params_p1["quats"] ** 2, axis=-1, keepdims=True) + 1e-8
+        )
+        params_p1["quats"] = quats_normalized
 
-        # Update parameters with clipped gradients
-        optimizer.quats = params["quats"] - lr * clip_grad(grads["quats"])
-        optimizer.trans = params["trans"] - lr * clip_grad(grads["trans"])
-        # Use smaller learning rate for sizes (more sensitive)
-        optimizer.sizes = params["sizes"] - lr * 0.1 * clip_grad(grads["sizes"], 0.5)
-
-        # Clamp sizes to prevent collapse and explosion
-        optimizer.sizes = mx.clip(optimizer.sizes, 0.1, 10.0)
-
-        # Normalize quaternions
-        quat_norms = mx.sqrt(mx.sum(optimizer.quats**2, axis=-1, keepdims=True) + 1e-8)
-        optimizer.quats = optimizer.quats / quat_norms
+        # Force evaluation to prevent graph explosion
+        mx.eval(*params_p1.values(), *m_p1.values(), *v_p1.values())
 
         if verbose and step % 50 == 0:
-            mx.eval(loss)
-            print(f"  Step {step}: loss = {float(loss):.6f}")
+            focals_now = mx.clip(mx.exp(frozen_log_focals), min_focals, max_focals)
+            print(
+                f"  Step {step:3d}: loss={float(loss_val):.4f}, focals={[float(f) for f in focals_now]} (frozen)"
+            )
 
-    # Phase 2: Fine alignment
-    if config.niter2 > 0 and config.optimize_depth:
-        if verbose:
-            print(f"Phase 2: Fine alignment ({config.niter2} iterations)")
+    # === Phase 2: Fine alignment (2D loss) ===
+    # Now we CAN optimize focals and depths (like PyTorch)
 
-        def loss_fn_phase2(params):
-            optimizer.quats = params["quats"]
-            optimizer.trans = params["trans"]
-            optimizer.log_focals = params["log_focals"]
-            optimizer.pps = params["pps"]
-            return compute_2d_loss(optimizer, corres, loss_2d)
+    if verbose:
+        print(f"\nPhase 2: Fine alignment ({niter2} iterations, lr={lr2})")
 
-        for step in range(config.niter2):
-            lr = cosine_schedule(step / max(config.niter2 - 1, 1), config.lr2, config.lr2 * 0.1)
+    # Parameters for Phase 2: NOW include focals and depths
+    params_p2 = {
+        "log_focals": frozen_log_focals,  # Now trainable
+        "pps_norm": pps_norm,
+        "trans": params_p1["trans"],
+        "quats": params_p1["quats"],
+        "log_sizes": params_p1["log_sizes"],
+        "core_depth": frozen_core_depth,  # Now trainable
+    }
 
-            params = {
-                "quats": optimizer.quats,
-                "trans": optimizer.trans,
-                "log_focals": optimizer.log_focals,
-                "pps": optimizer.pps,
-            }
+    m_p2 = {k: mx.zeros_like(v) for k, v in params_p2.items()}
+    v_p2 = {k: mx.zeros_like(v) for k, v in params_p2.items()}
 
-            loss, grads = mx.value_and_grad(loss_fn_phase2)(params)
+    def loss_phase2(log_focals, pps_norm, trans, quats, log_sizes, core_depth):
+        """Total loss for Phase 2."""
+        K, cam2w, depthmaps, focals = make_K_cam_depth(
+            log_focals, pps_norm, trans, quats, log_sizes, core_depth
+        )
+        pts3d = make_pts3d(K, cam2w, depthmaps, focals)
 
-            # Clip gradients
-            def clip_grad(g, max_norm=1.0):
-                norm = mx.sqrt(mx.sum(g**2) + 1e-8)
-                scale = mx.minimum(max_norm / norm, mx.array(1.0))
-                return g * scale
+        loss_2d = compute_loss_2d(K, cam2w, pts3d, loss2_fn)
+        loss_d = compute_loss_dust3r(cam2w, pts3d, lossd_fn)
 
-            optimizer.quats = params["quats"] - lr * clip_grad(grads["quats"])
-            optimizer.trans = params["trans"] - lr * clip_grad(grads["trans"])
-            optimizer.log_focals = params["log_focals"] - lr * clip_grad(grads["log_focals"], 0.1)
-            optimizer.pps = params["pps"] - lr * clip_grad(grads["pps"], 0.1)
+        return loss_2d + loss_dust3r_w * loss_d
 
-            # Normalize quaternions
-            quat_norms = mx.sqrt(mx.sum(optimizer.quats**2, axis=-1, keepdims=True) + 1e-8)
-            optimizer.quats = optimizer.quats / quat_norms
+    # Optimization loop Phase 2
+    for step in range(niter2):
+        alpha = step / max(niter2 - 1, 1)
+        lr = cosine_schedule(alpha, lr2, 0)  # PyTorch uses lr_end=0
 
-            # Clamp principal points
-            optimizer.pps = mx.clip(optimizer.pps, 0.25, 0.75)
+        # Compute loss and gradients
+        loss_val, grads = mx.value_and_grad(loss_phase2, argnums=(0, 1, 2, 3, 4, 5))(
+            params_p2["log_focals"],
+            params_p2["pps_norm"],
+            params_p2["trans"],
+            params_p2["quats"],
+            params_p2["log_sizes"],
+            params_p2["core_depth"],
+        )
 
-            if verbose and step % 50 == 0:
-                mx.eval(loss)
-                print(f"  Step {step}: loss = {float(loss):.6f}")
+        grad_dict = {
+            "log_focals": grads[0],
+            "pps_norm": grads[1],
+            "trans": grads[2],
+            "quats": grads[3],
+            "log_sizes": grads[4],
+            "core_depth": grads[5],
+        }
 
-    return optimizer
+        # Adam update
+        adam_step(params_p2, grad_dict, m_p2, v_p2, step, lr, beta1=0.9, beta2=0.9)
+
+        # Force evaluation to prevent graph explosion
+        mx.eval(*params_p2.values(), *m_p2.values(), *v_p2.values())
+
+        if verbose and step % 50 == 0:
+            print(f"  Step {step:3d}: loss={float(loss_val):.4f} px")
+
+    # === Final results ===
+
+    K, cam2w, depthmaps, focals = make_K_cam_depth(
+        params_p2["log_focals"],
+        params_p2["pps_norm"],
+        params_p2["trans"],
+        params_p2["quats"],
+        params_p2["log_sizes"],
+        params_p2["core_depth"],
+    )
+    pts3d = make_pts3d(K, cam2w, depthmaps, focals)
+
+    # Convert depthmaps to 2D
+    depthmaps_2d = []
+    for i in range(n_imgs):
+        H, W = imsizes_hw[i]
+        H_sub = (H + subsample - 1) // subsample
+        W_sub = (W + subsample - 1) // subsample
+        d = depthmaps[i].reshape(H_sub, W_sub)
+        depthmaps_2d.append(d)
+
+    if verbose:
+        print(f"\nFinal focals: {[float(f) for f in focals]}")
+        print(f"Final sizes: {[float(mx.exp(s)) for s in params_p2['log_sizes']]}")
+
+    return {
+        "intrinsics": K,
+        "cam2w": cam2w,
+        "depthmaps": depthmaps_2d,
+        "focals": focals,
+        "pts3d": pts3d,
+        "pps_norm": params_p2["pps_norm"],
+        "log_sizes": params_p2["log_sizes"],
+    }
