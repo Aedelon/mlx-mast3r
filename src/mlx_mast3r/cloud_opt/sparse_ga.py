@@ -16,7 +16,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-from .geometry import depthmap_to_pts3d, geotrf, inv
+from .geometry import depthmap_to_pts3d, depthmap_to_pts3d_mlx, geotrf, geotrf_mlx, inv
 from .optimizer import build_mst_from_correspondences
 from .optimizer import sparse_scene_optimizer as _sparse_optimizer_core
 
@@ -144,8 +144,9 @@ class SparseGAResult:
     ) -> tuple[list[mx.array], list[mx.array], list[mx.array]]:
         """Get dense 3D points from depthmaps.
 
-        The optimizer already applies global_scaling to both poses and depths,
-        ensuring consistent scale between translations and depth values.
+        The optimizer applies a reparametrization to camera poses that shifts
+        all cameras including the root. We compensate by transforming all poses
+        relative to the root camera (cam 0), making it the world origin.
 
         Args:
             clean_depth: Apply depth cleaning
@@ -156,6 +157,11 @@ class SparseGAResult:
         """
         pts3d_list = []
         depth_list = []
+
+        # Get inverse of root pose to recenter the scene
+        # This compensates for the trans_offset reparametrization
+        root_pose = self.cam2w[0]
+        root_pose_inv = mx.linalg.inv(root_pose, stream=mx.cpu)
 
         for i in range(self.n_imgs):
             H, W = self.depthmaps[i].shape
@@ -183,14 +189,16 @@ class SparseGAResult:
                 ]
             )
 
-            # Unproject to 3D
-            pts3d = depthmap_to_pts3d(depth, K)
+            # Unproject to 3D (use MLX native version)
+            pts3d = depthmap_to_pts3d_mlx(depth, K)
 
-            # Transform to world coordinates using optimized poses
-            # Poses already have global_scaling applied to translations
+            # Transform to world coordinates using recentered poses
+            # cam2w_recentered = root_pose_inv @ cam2w[i]
+            # This makes cam 0 the identity (world origin)
             cam2w = self.cam2w[i]
+            cam2w_recentered = root_pose_inv @ cam2w
 
-            pts3d_world = geotrf(cam2w, pts3d.reshape(-1, 3)).reshape(H, W, 3)
+            pts3d_world = geotrf_mlx(cam2w_recentered, pts3d.reshape(-1, 3)).reshape(H, W, 3)
 
             pts3d_list.append(pts3d_world)
             depth_list.append(depth)
@@ -1250,9 +1258,9 @@ def sparse_scene_optimizer(
             [0, 0, 1],
         ])
 
-        # Unproject and transform
-        pts3d = depthmap_to_pts3d(depth, K)
-        pts3d_world = geotrf(poses[i], pts3d.reshape(-1, 3))
+        # Unproject and transform (use MLX native versions)
+        pts3d = depthmap_to_pts3d_mlx(depth, K)
+        pts3d_world = geotrf_mlx(poses[i], pts3d.reshape(-1, 3))
 
         # depths is already subsampled by optimizer, so pts3d_world matches
         # depth shape is (H_sub, W_sub), pts3d_world is (H_sub * W_sub, 3)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from .geometry import depthmap_to_pts3d, geotrf, inv
+from .geometry import depthmap_to_pts3d_mlx, geotrf_mlx, inv_mlx
 
 
 def clean_pointcloud(
@@ -41,7 +41,18 @@ def clean_pointcloud(
     cleaned_confs = [mx.array(c) for c in confs]
 
     for i in range(n_views):
-        H, W = confs[i].shape
+        # Get H, W from pts3d shape (confs may be 1D or 2D)
+        if pts3d[i].ndim == 3:
+            H, W = pts3d[i].shape[:2]
+        else:
+            # Flat pts3d, try to infer from confs
+            if confs[i].ndim == 2:
+                H, W = confs[i].shape
+            else:
+                # Both flat, assume square-ish
+                n = len(confs[i].reshape(-1))
+                H = int(np.sqrt(n))
+                W = n // H
         pts3d_i = pts3d[i].reshape(-1, 3)  # [HW, 3]
         conf_i = confs[i].reshape(-1)
 
@@ -54,7 +65,7 @@ def clean_pointcloud(
             w2c_j = w2cams[j]
 
             # Project points from view i to view j
-            pts_cam_j = geotrf(w2c_j, pts3d_i)  # [HW, 3]
+            pts_cam_j = geotrf_mlx(w2c_j, pts3d_i)  # [HW, 3]
 
             # Project to 2D
             z_j = pts_cam_j[:, 2:3]
@@ -171,11 +182,11 @@ class TSDFPostProcess:
                 ]
             )
 
-            # Unproject to 3D
-            pts3d = depthmap_to_pts3d(depth, K)
+            # Unproject to 3D (use MLX native version)
+            pts3d = depthmap_to_pts3d_mlx(depth, K)
 
             # Transform to world
-            pts3d_world = geotrf(cam2w[i], pts3d.reshape(-1, 3)).reshape(H, W, 3)
+            pts3d_world = geotrf_mlx(cam2w[i], pts3d.reshape(-1, 3)).reshape(H, W, 3)
 
             pts3d_list.append(pts3d_world)
             depth_list.append(depth)
@@ -197,7 +208,7 @@ class TSDFPostProcess:
                 intrinsics.append(K)
 
             # Get world-to-camera transforms
-            w2cams = inv(cam2w)
+            w2cams = inv_mlx(cam2w)
 
             # Clean pointcloud
             conf_list = clean_pointcloud(

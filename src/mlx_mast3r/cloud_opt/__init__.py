@@ -7,7 +7,16 @@ Copyright (c) 2025 Delanoe Pirard / Aedelon. Apache 2.0 License.
 Original dust3r code: Copyright (C) 2024-present Naver Corporation. CC BY-NC-SA 4.0.
 """
 
-from .geometry import depthmap_to_pts3d, geotrf, inv, xy_grid
+from .geometry import (
+    depthmap_to_pts3d,
+    depthmap_to_pts3d_mlx,
+    geotrf,
+    geotrf_mlx,
+    inv,
+    inv_mlx,
+    xy_grid,
+    xy_grid_mlx,
+)
 from .focal import estimate_focal
 from .pair_viewer import PairViewer
 from .scene import Scene
@@ -19,11 +28,16 @@ from .sparse_ga import SparseGAResult, sparse_global_alignment
 from .tsdf import TSDFPostProcess, apply_tsdf_cleaning, clean_pointcloud
 
 __all__ = [
-    # Geometry
+    # Geometry (numpy)
     "inv",
     "geotrf",
     "xy_grid",
     "depthmap_to_pts3d",
+    # Geometry (MLX native)
+    "inv_mlx",
+    "geotrf_mlx",
+    "xy_grid_mlx",
+    "depthmap_to_pts3d_mlx",
     # Focal estimation
     "estimate_focal",
     # Viewers
