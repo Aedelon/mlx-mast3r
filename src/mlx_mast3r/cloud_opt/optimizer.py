@@ -675,9 +675,11 @@ def sparse_scene_optimizer(
         print(f"\nPhase 2: Fine alignment ({niter2} iterations, lr={lr2})")
 
     # Parameters for Phase 2: NOW include focals and depths
+    # NOTE: pps_norm is NOT optimized (like PyTorch default opt_pp=False)
+    # Optimizing pp can lead to divergence, especially for portrait images
+    frozen_pps_norm = pps_norm
     params_p2 = {
         "log_focals": frozen_log_focals,  # Now trainable
-        "pps_norm": pps_norm,
         "trans": params_p1["trans"],
         "quats": params_p1["quats"],
         "log_sizes": params_p1["log_sizes"],
@@ -687,10 +689,10 @@ def sparse_scene_optimizer(
     m_p2 = {k: mx.zeros_like(v) for k, v in params_p2.items()}
     v_p2 = {k: mx.zeros_like(v) for k, v in params_p2.items()}
 
-    def loss_phase2(log_focals, pps_norm, trans, quats, log_sizes, core_depth):
+    def loss_phase2(log_focals, trans, quats, log_sizes, core_depth):
         """Total loss for Phase 2."""
         K, cam2w, depthmaps, focals = make_K_cam_depth(
-            log_focals, pps_norm, trans, quats, log_sizes, core_depth
+            log_focals, frozen_pps_norm, trans, quats, log_sizes, core_depth
         )
         pts3d = make_pts3d(K, cam2w, depthmaps, focals)
 
@@ -704,10 +706,9 @@ def sparse_scene_optimizer(
         alpha = step / max(niter2 - 1, 1)
         lr = cosine_schedule(alpha, lr2, 0)  # PyTorch uses lr_end=0
 
-        # Compute loss and gradients
-        loss_val, grads = mx.value_and_grad(loss_phase2, argnums=(0, 1, 2, 3, 4, 5))(
+        # Compute loss and gradients (pps_norm is frozen, only 5 params)
+        loss_val, grads = mx.value_and_grad(loss_phase2, argnums=(0, 1, 2, 3, 4))(
             params_p2["log_focals"],
-            params_p2["pps_norm"],
             params_p2["trans"],
             params_p2["quats"],
             params_p2["log_sizes"],
@@ -716,11 +717,10 @@ def sparse_scene_optimizer(
 
         grad_dict = {
             "log_focals": grads[0],
-            "pps_norm": grads[1],
-            "trans": grads[2],
-            "quats": grads[3],
-            "log_sizes": grads[4],
-            "core_depth": grads[5],
+            "trans": grads[1],
+            "quats": grads[2],
+            "log_sizes": grads[3],
+            "core_depth": grads[4],
         }
 
         # Adam update
@@ -736,7 +736,7 @@ def sparse_scene_optimizer(
 
     K, cam2w, depthmaps, focals = make_K_cam_depth(
         params_p2["log_focals"],
-        params_p2["pps_norm"],
+        frozen_pps_norm,  # Use frozen principal points
         params_p2["trans"],
         params_p2["quats"],
         params_p2["log_sizes"],
@@ -763,6 +763,6 @@ def sparse_scene_optimizer(
         "depthmaps": depthmaps_2d,
         "focals": focals,
         "pts3d": pts3d,
-        "pps_norm": params_p2["pps_norm"],
+        "pps_norm": frozen_pps_norm,  # Use frozen principal points
         "log_sizes": params_p2["log_sizes"],
     }
