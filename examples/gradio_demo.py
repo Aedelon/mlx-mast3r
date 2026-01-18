@@ -673,17 +673,29 @@ def export_multiview_glb(
         conf = np.array(conf_list[i])
         img = result.imgs[i]
 
-        # Flatten
+        # Flatten pts3d
         H, W = pts.shape[:2] if pts.ndim > 2 else (1, len(pts))
         pts_flat = pts.reshape(-1, 3)
         conf_flat = conf.reshape(-1)
 
-        # Get colors
+        # Get colors - subsample image to match pts3d resolution
         if img.ndim == 3:
-            colors = img.reshape(-1, 3)
+            img_H, img_W = img.shape[:2]
+            # Calculate subsample factor
+            subsample = max(1, img_H // H) if H > 1 else 1
+            if subsample > 1:
+                # Subsample image to match pts3d grid
+                colors = img[::subsample, ::subsample, :].reshape(-1, 3)
+            else:
+                colors = img.reshape(-1, 3)
             if colors.max() <= 1.0:
                 colors = (colors * 255).astype(np.uint8)
         else:
+            colors = np.ones((len(pts_flat), 3), dtype=np.uint8) * 128
+
+        # Ensure colors match pts length
+        if len(colors) != len(pts_flat):
+            # Fallback: use gray
             colors = np.ones((len(pts_flat), 3), dtype=np.uint8) * 128
 
         # Apply masks
