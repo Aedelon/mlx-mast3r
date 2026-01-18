@@ -162,12 +162,23 @@ class SparseGAResult:
             depth = self.depthmaps[i]
 
             # Use optimized focals for unprojection
-            f = self.focals[i]
-            pp = self.principal_points[i]
+            # IMPORTANT: Scale intrinsics to match depthmap resolution
+            f_full = float(self.focals[i])
+            pp_full = self.principal_points[i]
+
+            # Depthmaps are subsampled, so scale intrinsics accordingly
+            # Full resolution is subsample * depthmap resolution
+            H_full = H * subsample
+            W_full = W * subsample
+            scale = H / H_full  # = 1/subsample
+
+            f = f_full * scale
+            pp = pp_full * scale
+
             K = mx.array(
                 [
-                    [f, 0, pp[0]],
-                    [0, f, pp[1]],
+                    [f, 0, float(pp[0])],
+                    [0, f, float(pp[1])],
                     [0, 0, 1],
                 ]
             )

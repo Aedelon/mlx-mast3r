@@ -599,17 +599,54 @@ def convert_scene_to_glb(
 
     # Add point cloud or mesh
     if as_pointcloud:
-        pts = np.concatenate([p[m.ravel()] for p, m in zip(pts3d, masks)]).reshape(-1, 3)
-        col = np.concatenate([im[m] for im, m in zip(imgs, masks)]).reshape(-1, 3)
+        all_pts = []
+        all_colors = []
+
+        for i, (p, m, im) in enumerate(zip(pts3d, masks, imgs)):
+            # Flatten pts3d: (H, W, 3) -> (H*W, 3)
+            H, W = p.shape[:2]
+            pts_flat = p.reshape(-1, 3)
+            mask_flat = m.ravel()
+
+            # Subsample image to match pts3d resolution
+            img_H, img_W = im.shape[:2]
+            subsample = max(1, img_H // H) if H > 1 else 1
+            if subsample > 1:
+                colors = im[::subsample, ::subsample, :].reshape(-1, 3)
+            else:
+                colors = im.reshape(-1, 3)
+
+            # Ensure shapes match
+            if len(colors) != len(pts_flat):
+                colors = colors[: len(pts_flat)]
+
+            all_pts.append(pts_flat[mask_flat])
+            all_colors.append(colors[mask_flat])
+
+        pts = np.concatenate(all_pts)
+        col = np.concatenate(all_colors)
         valid = np.isfinite(pts.sum(axis=1))
         pct = trimesh.PointCloud(pts[valid], colors=col[valid])
         scene.add_geometry(pct)
     else:
         meshes = []
         for i in range(len(imgs)):
-            pts3d_i = pts3d[i].reshape(imgs[i].shape)
+            pts3d_i = pts3d[i]
+            H, W = pts3d_i.shape[:2]
+            img_i = imgs[i]
+
+            # Subsample image to match pts3d resolution if needed
+            img_H, img_W = img_i.shape[:2]
+            subsample = max(1, img_H // H) if H > 1 else 1
+            if subsample > 1:
+                img_i = img_i[::subsample, ::subsample, :]
+
+            # Ensure shapes match
+            if img_i.shape[:2] != pts3d_i.shape[:2]:
+                img_i = img_i[: pts3d_i.shape[0], : pts3d_i.shape[1], :]
+
             msk_i = masks[i] & np.isfinite(pts3d_i.sum(axis=-1))
-            meshes.append(pts3d_to_trimesh(imgs[i], pts3d_i, msk_i))
+            meshes.append(pts3d_to_trimesh(img_i, pts3d_i, msk_i))
         mesh = trimesh.Trimesh(**cat_meshes(meshes))
         scene.add_geometry(mesh)
 
