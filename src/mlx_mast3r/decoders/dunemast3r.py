@@ -304,10 +304,12 @@ class DuneMast3rDecoder(nn.Module):
         self._rope_positions = positions
 
         # Propagate to all decoder blocks
+        # DecoderBlock.set_rope_tables expects: (cos, sin, positions_self, positions_cross_q, positions_cross_k)
+        # For DUNE, all positions are the same (all patches from both views)
         for blk in self.dec_blocks:
-            blk.set_rope_tables(cos, sin, positions)
+            blk.set_rope_tables(cos, sin, positions, positions, positions)
         for blk in self.dec_blocks2:
-            blk.set_rope_tables(cos, sin, positions)
+            blk.set_rope_tables(cos, sin, positions, positions, positions)
 
     def __call__(
         self,
