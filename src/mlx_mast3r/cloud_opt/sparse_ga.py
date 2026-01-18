@@ -1157,6 +1157,7 @@ def sparse_scene_optimizer(
         print(f"init focals = {[float(f) for f in init_focals]}")
 
     # Prepare depths and compute medians (like PyTorch)
+    # Also filter outliers to prevent large depth values from causing scattered points
     init_depths = []
     median_depths = []
     for i, depth in enumerate(core_depth):
@@ -1170,6 +1171,14 @@ def sparse_scene_optimizer(
             d = mx.pad(d, [(0, expected_size - len(d))])
         elif len(d) > expected_size:
             d = d[:expected_size]
+
+        # Filter depth outliers: clip to 2x the 95th percentile
+        # This prevents distant/sky regions from causing scattered points
+        d_np = np.array(d)
+        p95 = np.percentile(d_np, 95)
+        max_depth = p95 * 2.0
+        d = mx.clip(d, a_min=None, a_max=mx.array(max_depth))
+
         d_2d = d.reshape(H_sub, W_sub)
         init_depths.append(d_2d)
 
