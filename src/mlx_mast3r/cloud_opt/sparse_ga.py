@@ -16,7 +16,14 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-from .geometry import depthmap_to_pts3d, depthmap_to_pts3d_mlx, geotrf, geotrf_mlx, inv
+from .geometry import (
+    clean_pointcloud_mlx,
+    depthmap_to_pts3d,
+    depthmap_to_pts3d_mlx,
+    geotrf,
+    geotrf_mlx,
+    inv,
+)
 from .optimizer import build_mst_from_correspondences
 from .optimizer import sparse_scene_optimizer as _sparse_optimizer_core
 
@@ -142,68 +149,163 @@ class SparseGAResult:
         clean_depth: bool = True,
         subsample: int = 8,
     ) -> tuple[list[mx.array], list[mx.array], list[mx.array]]:
-        """Get dense 3D points from depthmaps.
+        """Get dense 3D points from depthmaps using anchor-based densification.
 
-        The optimizer applies a reparametrization to camera poses that shifts
-        all cameras including the root. We compensate by transforming all poses
-        relative to the root camera (cam 0), making it the world origin.
+        Like PyTorch MASt3R, this uses anchor_depth_offsets to densify sparse
+        depthmaps to full resolution. The optimizer applies a reparametrization
+        to camera poses that shifts all cameras including the root. We compensate
+        by transforming all poses relative to the root camera (cam 0).
 
         Args:
-            clean_depth: Apply depth cleaning
+            clean_depth: Apply multi-view consistency cleaning (removes outliers)
             subsample: Subsampling factor
 
         Returns:
-            Tuple of (pts3d, depthmaps, confs) lists
+            Tuple of (pts3d, depthmaps, confs) lists at full resolution
         """
         pts3d_list = []
         depth_list = []
+        confs_list = []
+        K_list = []
+        cam2w_list = []
 
         # Get inverse of root pose to recenter the scene
-        # This compensates for the trans_offset reparametrization
         root_pose = self.cam2w[0]
         root_pose_inv = mx.linalg.inv(root_pose, stream=mx.cpu)
 
         for i in range(self.n_imgs):
-            H, W = self.depthmaps[i].shape
-            depth = self.depthmaps[i]
+            H_sub, W_sub = self.depthmaps[i].shape
+            depth_sub = self.depthmaps[i].flatten()  # Subsampled depth [H_sub * W_sub]
 
-            # Use optimized focals for unprojection
-            # IMPORTANT: Scale intrinsics to match depthmap resolution
-            f_full = float(self.focals[i])
-            pp_full = self.principal_points[i]
+            # Full resolution intrinsics (like PyTorch)
+            f = float(self.focals[i])
+            pp = self.principal_points[i]
 
-            # Depthmaps are subsampled, so scale intrinsics accordingly
-            # Full resolution is subsample * depthmap resolution
-            H_full = H * subsample
-            W_full = W * subsample
-            scale = H / H_full  # = 1/subsample
+            # Load canonical view from cache for densification
+            canon = None
+            conf = None
+            if self.canonical_paths and self.canonical_paths[i]:
+                try:
+                    data = np.load(self.canonical_paths[i])
+                    canon = mx.array(data["canon"])
+                    if "conf" in data:
+                        conf = mx.array(data["conf"])
+                except Exception:
+                    pass
 
-            f = f_full * scale
-            pp = pp_full * scale
+            if canon is not None:
+                # Use anchor-based densification like PyTorch
+                H, W = canon.shape[:2]
+                canon_depth = canon[..., 2]  # Full resolution depth
 
-            K = mx.array(
-                [
+                # Create dense pixel grid at full resolution
+                pixels_x = mx.arange(W, dtype=mx.float32)
+                pixels_y = mx.arange(H, dtype=mx.float32)
+                py, px = mx.meshgrid(pixels_y, pixels_x, indexing="ij")
+                pixels = mx.stack([px.flatten(), py.flatten()], axis=-1)  # [H*W, 2]
+
+                # Compute anchor indices and offsets for ALL pixels
+                W_sub_calc = (W + subsample - 1) // subsample
+                H_sub_calc = (H + subsample - 1) // subsample
+
+                # Anchor indices: which subsampled cell each pixel belongs to
+                anchor_idx = (py.flatten().astype(mx.int32) // subsample) * W_sub_calc + \
+                             (px.flatten().astype(mx.int32) // subsample)
+                anchor_idx = mx.clip(anchor_idx, 0, H_sub_calc * W_sub_calc - 1)
+
+                # Compute depth offsets: ratio of pixel depth to anchor depth
+                # Get anchor center coordinates
+                anchor_cy = (py.flatten().astype(mx.int32) // subsample) * subsample + subsample // 2
+                anchor_cx = (px.flatten().astype(mx.int32) // subsample) * subsample + subsample // 2
+                anchor_cy = mx.clip(anchor_cy, 0, H - 1)
+                anchor_cx = mx.clip(anchor_cx, 0, W - 1)
+
+                # Get depths
+                ref_depth = canon_depth[anchor_cy.astype(mx.int32), anchor_cx.astype(mx.int32)]
+                pixel_depth = canon_depth[py.flatten().astype(mx.int32), px.flatten().astype(mx.int32)]
+
+                # Compute offset ratio (with safety for division)
+                offset = pixel_depth / mx.maximum(ref_depth, mx.array(1e-6))
+
+                # Focal compensation like PyTorch
+                if self.base_focals is not None:
+                    base_f = float(self.base_focals[i])
+                    focal_ratio = base_f / f
+                    offset = 1.0 + (offset - 1.0) * focal_ratio
+
+                # Densify: depth = subsampled_depth[anchor_idx] * offset
+                depth_dense = depth_sub[anchor_idx] * offset
+                depth_dense = depth_dense.reshape(H, W)
+
+                # Build full resolution intrinsics
+                K = mx.array([
                     [f, 0, float(pp[0])],
                     [0, f, float(pp[1])],
                     [0, 0, 1],
-                ]
-            )
+                ])
 
-            # Unproject to 3D (use MLX native version)
-            pts3d = depthmap_to_pts3d_mlx(depth, K)
+                # Unproject to 3D at full resolution
+                pts3d = depthmap_to_pts3d_mlx(depth_dense, K)
 
-            # Transform to world coordinates using recentered poses
-            # cam2w_recentered = root_pose_inv @ cam2w[i]
-            # This makes cam 0 the identity (world origin)
+                # Use full resolution confidence if available
+                if conf is None:
+                    conf = mx.ones((H, W))
+
+            else:
+                # Fallback: use subsampled data (like before)
+                H, W = H_sub, W_sub
+                H_full = H * subsample
+                W_full = W * subsample
+                scale = H / H_full
+
+                f_scaled = f * scale
+                pp_scaled = pp * scale
+
+                K = mx.array([
+                    [f_scaled, 0, float(pp_scaled[0])],
+                    [0, f_scaled, float(pp_scaled[1])],
+                    [0, 0, 1],
+                ])
+
+                depth_dense = self.depthmaps[i]
+                pts3d = depthmap_to_pts3d_mlx(depth_dense, K)
+
+                # Reshape conf
+                conf_raw = self.confs[i]
+                if conf_raw.ndim == 1 and conf_raw.size == H * W:
+                    conf = conf_raw.reshape(H, W)
+                else:
+                    conf = mx.ones((H, W))
+
+            K_list.append(K)
+
+            # Transform to world coordinates with recentered poses
             cam2w = self.cam2w[i]
             cam2w_recentered = root_pose_inv @ cam2w
+            cam2w_list.append(cam2w_recentered)
 
             pts3d_world = geotrf_mlx(cam2w_recentered, pts3d.reshape(-1, 3)).reshape(H, W, 3)
 
             pts3d_list.append(pts3d_world)
-            depth_list.append(depth)
+            depth_list.append(depth_dense)
+            confs_list.append(conf)
 
-        return pts3d_list, depth_list, self.confs
+        # Apply multi-view consistency cleaning if requested
+        if clean_depth and self.n_imgs > 1:
+            world2cam_list = [mx.linalg.inv(c, stream=mx.cpu) for c in cam2w_list]
+
+            confs_cleaned = clean_pointcloud_mlx(
+                im_confs=confs_list,
+                K_list=K_list,
+                world2cams=world2cam_list,
+                depthmaps=depth_list,
+                all_pts3d=pts3d_list,
+                tol=0.001,
+                bad_conf=0.0,
+            )
+            return pts3d_list, depth_list, confs_cleaned
+
+        return pts3d_list, depth_list, confs_list
 
 
 def hash_md5(s: str) -> str:
@@ -730,11 +832,14 @@ def prepare_canonical_data(
         # Try to load from cache
         canon = None
         focal = None
+        cconf_cached = None
         if cache and os.path.isfile(cache):
             try:
                 data = np.load(cache)
                 canon = mx.array(data["canon"])
                 focal = mx.array(data["focal"])
+                if "conf" in data:
+                    cconf_cached = mx.array(data["conf"])
             except Exception:
                 pass
 
@@ -813,10 +918,12 @@ def prepare_canonical_data(
                 H, W = canon.shape[:2]
                 pp = mx.array([W / 2, H / 2])
                 focal = estimate_focal_from_depth(canon, pp)
+                # Store canon pointmap, focal, and confidence for densification
                 np.savez(
                     mkdir_for(cache),
                     canon=np.array(canon),
                     focal=np.array(focal),
+                    conf=np.array(cconf) if "cconf" in locals() and cconf is not None else np.ones((H, W)),
                 )
 
         if canon is None:
@@ -843,9 +950,12 @@ def prepare_canonical_data(
         canon_depth_full = canon[..., 2]  # Full depth map [H, W]
         idxs, offsets = anchor_depth_offsets(canon_depth_full, pixels, subsample=subsample)
 
-        # Ensure cconf is defined
+        # Ensure cconf is defined - use cached conf if available
         if "cconf" not in locals() or cconf is None:
-            cconf = mx.ones((H, W))
+            if cconf_cached is not None:
+                cconf = cconf_cached
+            else:
+                cconf = mx.ones((H, W))
 
         canonical_views[img] = {
             "pp": pp,
@@ -1172,12 +1282,9 @@ def sparse_scene_optimizer(
         elif len(d) > expected_size:
             d = d[:expected_size]
 
-        # Filter depth outliers: clip to 2x the 95th percentile
-        # This prevents distant/sky regions from causing scattered points
-        d_np = np.array(d)
-        p95 = np.percentile(d_np, 95)
-        max_depth = p95 * 2.0
-        d = mx.clip(d, a_min=None, a_max=mx.array(max_depth))
+        # Ensure positive depths (like PyTorch: d.clip(min=1e-4))
+        # Outlier removal is done later via clean_pointcloud_mlx
+        d = mx.clip(d, a_min=mx.array(1e-4), a_max=None)
 
         d_2d = d.reshape(H_sub, W_sub)
         init_depths.append(d_2d)

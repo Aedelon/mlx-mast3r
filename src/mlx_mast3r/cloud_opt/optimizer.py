@@ -242,8 +242,10 @@ def sparse_scene_optimizer(
 
     # Compute image diagonals for focal constraints
     diags = mx.array([np.sqrt(H**2 + W**2) for H, W in imsizes_hw])
-    min_focals = 0.25 * diags
-    max_focals = 10.0 * diags
+    # Tighter focal constraints to prevent divergence
+    # Allow focals to vary by at most 50% from initial estimate
+    min_focals = mx.maximum(0.5 * base_focals, 0.25 * diags)
+    max_focals = mx.minimum(1.5 * base_focals, 10.0 * diags)
 
     # === Initialize parameters exactly like PyTorch ===
 

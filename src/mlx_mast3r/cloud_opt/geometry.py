@@ -302,3 +302,97 @@ def inv_mlx(mat: mx.array) -> mx.array:
     """
     # mx.linalg.inv is not yet supported on GPU, use CPU stream
     return mx.linalg.inv(mat, stream=mx.cpu)
+
+
+def clean_pointcloud_mlx(
+    im_confs: list[mx.array],
+    K_list: list[mx.array],
+    world2cams: list[mx.array],
+    depthmaps: list[mx.array],
+    all_pts3d: list[mx.array],
+    tol: float = 0.001,
+    bad_conf: float = 0.0,
+) -> list[mx.array]:
+    """Clean point cloud by checking multi-view consistency.
+
+    Method:
+    1) Express all 3D points in each camera coordinate frame
+    2) If a point projects in front of another view's depthmap, lower its confidence
+
+    This removes outliers that are geometrically inconsistent across views.
+
+    Args:
+        im_confs: List of confidence maps per image (H, W).
+        K_list: List of intrinsic matrices per image (3x3).
+        world2cams: List of world-to-camera transforms per image (4x4).
+        depthmaps: List of depth maps per image (H, W).
+        all_pts3d: List of 3D points per image (H, W, 3) in world coordinates.
+        tol: Tolerance for depth comparison (default 0.001 = 0.1%).
+        bad_conf: Confidence to assign to bad points (default 0).
+
+    Returns:
+        List of cleaned confidence maps.
+    """
+    n_imgs = len(im_confs)
+    assert len(K_list) == n_imgs
+    assert len(world2cams) == n_imgs
+    assert len(depthmaps) == n_imgs
+    assert len(all_pts3d) == n_imgs
+    assert 0 <= tol < 1
+
+    # Clone confidences
+    res = [mx.array(c) for c in im_confs]
+
+    for i in range(n_imgs):
+        pts3d_i = all_pts3d[i]  # (H, W, 3) in world coords
+        H_i, W_i = im_confs[i].shape
+
+        for j in range(n_imgs):
+            if i == j:
+                continue
+
+            H_j, W_j = im_confs[j].shape
+
+            # Project pts3d[i] into camera j
+            # 1. Transform to camera j coordinates
+            proj_cam = geotrf_mlx(world2cams[j], pts3d_i.reshape(-1, 3))
+            proj_cam = proj_cam.reshape(H_i, W_i, 3)
+            proj_depth = proj_cam[..., 2]  # (H_i, W_i)
+
+            # 2. Project to image j coordinates (normalize by z)
+            K_j = K_list[j]
+            proj_2d = geotrf_mlx(K_j, proj_cam, norm=True, ncol=2)  # (H_i, W_i, 2)
+            u = mx.round(proj_2d[..., 0]).astype(mx.int32)
+            v = mx.round(proj_2d[..., 1]).astype(mx.int32)
+
+            # 3. Check which points are in visible cone (in front and within bounds)
+            msk_visible = (proj_depth > 0) & (u >= 0) & (u < W_j) & (v >= 0) & (v < H_j)
+
+            # 4. For visible points, compare depth
+            # Get reference depth from depthmap j at projected locations
+            u_valid = mx.clip(u, 0, W_j - 1)
+            v_valid = mx.clip(v, 0, H_j - 1)
+
+            # Sample depthmap and confidence at (v, u) locations
+            depth_j = depthmaps[j]
+            conf_j = im_confs[j]
+
+            # Flatten for indexing
+            idx_flat = v_valid.flatten() * W_j + u_valid.flatten()
+            depth_j_flat = depth_j.flatten()
+            conf_j_flat = conf_j.flatten()
+
+            ref_depth = depth_j_flat[idx_flat].reshape(H_i, W_i)
+            ref_conf = conf_j_flat[idx_flat].reshape(H_i, W_i)
+
+            # 5. Find bad points: in front AND less confident
+            # Point is "in front" if proj_depth < (1-tol) * ref_depth
+            in_front = proj_depth < (1 - tol) * ref_depth
+            less_confident = res[i] < ref_conf
+
+            bad_points = msk_visible & in_front & less_confident
+
+            # 6. Set bad points confidence to bad_conf
+            res[i] = mx.where(bad_points, mx.array(bad_conf), res[i])
+
+    return res
