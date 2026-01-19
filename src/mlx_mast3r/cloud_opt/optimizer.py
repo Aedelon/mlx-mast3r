@@ -20,26 +20,32 @@ from .schedules import cosine_schedule
 def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[dict[int, int], int]:
     """Build minimum spanning tree from correspondences.
 
-    Uses number of correspondences as edge weights (more = better connection).
-    Returns parent map and root node.
+    Uses sum of confidence weights as edge weights (more confident = better connection).
+    This is more robust than just counting correspondences.
 
     Args:
-        corres: List of correspondence dicts with idx1, idx2, and point counts
+        corres: List of correspondence dicts with idx1, idx2, and weights
         n_images: Total number of images
 
     Returns:
         Tuple of (parent_map {child: parent}, root_idx)
     """
-    # Build adjacency with weights = number of correspondences
-    adj: dict[tuple[int, int], int] = {}
+    # Build adjacency with weights = sum of confidences (like PyTorch)
+    adj: dict[tuple[int, int], float] = {}
     for c in corres:
         i, j = c["idx1"], c["idx2"]
         if i > j:
             i, j = j, i
         key = (i, j)
-        # Weight = number of correspondences (we want max, so use negative for MST)
-        n_pts = len(c.get("pts1_idx", c.get("pts1", [])))
-        adj[key] = adj.get(key, 0) + n_pts
+        # Weight = sum of confidence weights (more reliable than just count)
+        weights = c.get("weights", None)
+        if weights is not None:
+            weight = float(mx.sum(weights)) if isinstance(weights, mx.array) else sum(weights)
+        else:
+            # Fallback to count if no weights
+            n_pts = len(c.get("pts1_idx", c.get("pts1", [])))
+            weight = float(n_pts)
+        adj[key] = adj.get(key, 0.0) + weight
 
     # Prim's algorithm for MST (maximize connections = minimize -weight)
     if not adj:
@@ -242,10 +248,11 @@ def sparse_scene_optimizer(
 
     # Compute image diagonals for focal constraints
     diags = mx.array([np.sqrt(H**2 + W**2) for H, W in imsizes_hw])
-    # Tighter focal constraints to prevent divergence
-    # Allow focals to vary by at most 50% from initial estimate
-    min_focals = mx.maximum(0.5 * base_focals, 0.25 * diags)
-    max_focals = mx.minimum(1.5 * base_focals, 10.0 * diags)
+    # Tight focal constraints to prevent divergence in multi-view
+    # Allow focals to vary by at most 30% from base estimate
+    # This matches typical real camera variation and prevents optimization instability
+    min_focals = mx.maximum(0.7 * base_focals, 0.25 * diags)
+    max_focals = mx.minimum(1.3 * base_focals, 2.0 * diags)
 
     # === Initialize parameters exactly like PyTorch ===
 
@@ -442,12 +449,17 @@ def sparse_scene_optimizer(
 
         Uses slices into anchor-aggregated pts3d, like PyTorch MASt3R loss_3d.
         Only uses correspondences where max_conf > matching_conf_thr (like PyTorch).
+
+        PyTorch concatenates ALL correspondences and normalizes GLOBALLY:
+            confs = torch.cat(confs)
+            loss = confs @ pix_loss(pts3d_1, pts3d_2) / confs.sum()
         """
         if not corres:
             return mx.array(0.0)
 
-        total_loss = mx.array(0.0)
-        total_weight = mx.array(0.0)
+        all_pts1 = []
+        all_pts2 = []
+        all_confs = []
 
         for c in corres:
             # Filter by matching confidence (like PyTorch is_matching_ok)
@@ -471,29 +483,43 @@ def sparse_scene_optimizer(
             n = min(len(p1), len(p2), len(weights))
             if n == 0:
                 continue
-            p1 = p1[:n]
-            p2 = p2[:n]
-            w = weights[:n]
 
-            # Compute weighted loss
-            dist = loss_fn(p1, p2)
-            total_loss = total_loss + mx.sum(w * dist)
-            total_weight = total_weight + mx.sum(w)
+            all_pts1.append(p1[:n])
+            all_pts2.append(p2[:n])
+            all_confs.append(weights[:n])
 
-        return total_loss / mx.maximum(total_weight, mx.array(1e-8))
+        if not all_pts1:
+            return mx.array(0.0)
+
+        # Concatenate all (like PyTorch torch.cat)
+        pts3d_1 = mx.concatenate(all_pts1, axis=0)
+        pts3d_2 = mx.concatenate(all_pts2, axis=0)
+        confs = mx.concatenate(all_confs, axis=0)
+
+        # Global weighted loss (PyTorch: confs @ pix_loss / confs.sum())
+        dist = loss_fn(pts3d_1, pts3d_2)
+        cf_sum = mx.sum(confs)
+        loss = mx.sum(confs * dist) / mx.maximum(cf_sum, mx.array(1e-8))
+
+        return loss
 
     def compute_loss_2d(K, cam2w, pts3d, loss_fn):
         """2D reprojection loss (PyTorch-faithful).
 
-        For each correspondence, reproject 3D points from one image to
-        the other and compute 2D pixel distance.
-        Only uses correspondences where max_conf > matching_conf_thr (like PyTorch).
+        PyTorch iterates over target images and accumulates globally:
+            for img1, pix1, confs, cf_sum, slices in cleaned_corres2d:
+                pts3d_in_img1 = cat([pts3d[img2][slice2] for img2, slice2 in slices])
+                loss += confs @ pix_loss(pix1, reproj2d(pts3d_in_img1))
+                npix += confs.sum()
+            return loss / npix
+
+        We implement bidirectional for better symmetry in multi-view.
         """
         if not corres:
             return mx.array(0.0)
 
         total_loss = mx.array(0.0)
-        total_weight = mx.array(0.0)
+        total_npix = mx.array(0.0)
 
         for c in corres:
             # Filter by matching confidence (like PyTorch is_matching_ok)
@@ -526,17 +552,25 @@ def sparse_scene_optimizer(
             pix2 = pts2[:n]
             w = weights[:n]
 
-            # Project p2_3d to img1 (PyTorch-style: single direction)
+            # BIDIRECTIONAL 2D loss for better multi-view consistency
+            # Direction 1: Project p2_3d to img1
             w2cam1 = inv_pose(cam2w[idx1])
             proj_to_1 = reproj2d(K[idx1], w2cam1, p2_3d)
-
-            # Single direction 2D loss (matches PyTorch)
             dist1 = loss_fn(pix1, proj_to_1)
 
-            total_loss = total_loss + mx.sum(w * dist1)
-            total_weight = total_weight + mx.sum(w)
+            # Direction 2: Project p1_3d to img2
+            w2cam2 = inv_pose(cam2w[idx2])
+            proj_to_2 = reproj2d(K[idx2], w2cam2, p1_3d)
+            dist2 = loss_fn(pix2, proj_to_2)
 
-        return total_loss / mx.maximum(total_weight, mx.array(1e-8))
+            # Accumulate globally (like PyTorch)
+            total_loss = total_loss + mx.sum(w * dist1) + mx.sum(w * dist2)
+            total_npix = total_npix + 2.0 * mx.sum(w)  # Count both directions
+
+        if float(total_npix) < 1e-8:
+            return mx.array(0.0)
+
+        return total_loss / total_npix
 
     # Build set of low-confidence pairs (for dust3r loss filtering)
     # PyTorch only applies loss_dust3r to pairs where is_matching_ok is False
