@@ -18,10 +18,10 @@ from .schedules import cosine_schedule
 
 
 def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[dict[int, int], int]:
-    """Build minimum spanning tree from correspondences.
+    """Build minimum spanning tree from correspondences with optimal root centering.
 
     Uses sum of confidence weights as edge weights (more confident = better connection).
-    This is more robust than just counting correspondences.
+    Like PyTorch, finds the optimal center of the tree to minimize error accumulation.
 
     Args:
         corres: List of correspondence dicts with idx1, idx2, and weights
@@ -30,6 +30,8 @@ def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[d
     Returns:
         Tuple of (parent_map {child: parent}, root_idx)
     """
+    from collections import deque
+
     # Build adjacency with weights = sum of confidences (like PyTorch)
     adj: dict[tuple[int, int], float] = {}
     for c in corres:
@@ -52,13 +54,13 @@ def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[d
         # No correspondences, return identity (all connected to 0)
         return {i: 0 for i in range(1, n_images)}, 0
 
-    # Start from node 0
+    # Build MST using Prim's algorithm starting from node 0
     in_tree = {0}
-    parent_map: dict[int, int] = {}
+    edges: list[tuple[int, int]] = []  # List of (parent, child) edges
 
     while len(in_tree) < n_images:
         best_edge = None
-        best_weight = -1
+        best_weight = -1.0
 
         for (i, j), weight in adj.items():
             if (i in in_tree) != (j in in_tree):  # XOR - one in, one out
@@ -70,18 +72,63 @@ def build_mst_from_correspondences(corres: list[dict], n_images: int) -> tuple[d
             # Disconnected graph - connect remaining nodes to 0
             for i in range(n_images):
                 if i not in in_tree:
-                    parent_map[i] = 0
+                    edges.append((0, i))
                     in_tree.add(i)
         else:
             i, j = best_edge
             if i in in_tree:
-                parent_map[j] = i
+                edges.append((i, j))
                 in_tree.add(j)
             else:
-                parent_map[i] = j
+                edges.append((j, i))
                 in_tree.add(i)
 
-    return parent_map, 0
+    # Build undirected adjacency list from edges
+    neighbors: dict[int, list[int]] = {i: [] for i in range(n_images)}
+    for p, c in edges:
+        neighbors[p].append(c)
+        neighbors[c].append(p)
+
+    def bfs_distances(start: int) -> list[int]:
+        """BFS to compute distances from start node."""
+        dist = [-1] * n_images
+        dist[start] = 0
+        queue = deque([start])
+        while queue:
+            u = queue.popleft()
+            for v in neighbors[u]:
+                if dist[v] == -1:
+                    dist[v] = dist[u] + 1
+                    queue.append(v)
+        return dist
+
+    # Find optimal root (center of tree) like PyTorch:
+    # 1. BFS from node 0 to find farthest node
+    # 2. BFS from that node to find opposite end
+    # 3. BFS from opposite end
+    # 4. Root = node minimizing max distance to both ends
+    dist0 = bfs_distances(0)
+    far1 = max(range(n_images), key=lambda x: dist0[x])
+    dist1 = bfs_distances(far1)
+    far2 = max(range(n_images), key=lambda x: dist1[x])
+    dist2 = bfs_distances(far2)
+
+    # Optimal root minimizes max(dist1, dist2) - the center of the longest path
+    root = min(range(n_images), key=lambda x: max(dist1[x], dist2[x]))
+
+    # Rebuild parent_map with the optimal root using BFS
+    parent_map: dict[int, int] = {}
+    visited = {root}
+    queue = deque([root])
+    while queue:
+        u = queue.popleft()
+        for v in neighbors[u]:
+            if v not in visited:
+                parent_map[v] = u
+                visited.add(v)
+                queue.append(v)
+
+    return parent_map, root
 
 
 # Match PyTorch structure
@@ -313,9 +360,9 @@ def sparse_scene_optimizer(
             K_list.append(Ki)
         K = mx.stack(K_list)
 
-        # Sizes and global scaling (security against scale collapse)
+        # Sizes and global scaling (like PyTorch: 1 / sizes.min())
         sizes = mx.exp(log_sizes)
-        global_scaling = 1.0 / mx.minimum(mx.min(sizes), mx.array(1.0))
+        global_scaling = 1.0 / mx.maximum(mx.min(sizes), mx.array(1e-6))  # No clipping to 1.0
 
         # z_cameras: reparametrization like PyTorch
         z_cameras = sizes * median_depths * focals / base_focals
