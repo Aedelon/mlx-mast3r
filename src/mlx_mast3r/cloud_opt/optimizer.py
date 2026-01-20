@@ -13,6 +13,22 @@ from typing import Callable
 import mlx.core as mx
 import numpy as np
 
+from mlx_mast3r.constants import (
+    ADAM_BETA1,
+    ADAM_BETA2,
+    ADAM_EPS,
+    EPS,
+    FOCAL_MAX_DIAG_RATIO,
+    FOCAL_MAX_RATIO,
+    FOCAL_MIN_DIAG_RATIO,
+    FOCAL_MIN_RATIO,
+    GAMMA_LOSS_2D,
+    GAMMA_LOSS_3D,
+    GAMMA_LOSS_DUST3R,
+    MIN_DEPTH,
+    MIN_SIZE,
+)
+
 from .losses import gamma_loss
 from .schedules import cosine_schedule
 
@@ -140,7 +156,7 @@ PairOfSlices = namedtuple(
 
 def normalize_quat(q: mx.array) -> mx.array:
     """Normalize quaternion."""
-    return q / mx.sqrt(mx.sum(q * q, axis=-1, keepdims=True) + 1e-8)
+    return q / mx.sqrt(mx.sum(q * q, axis=-1, keepdims=True) + EPS)
 
 
 def inv_pose(pose: mx.array) -> mx.array:
@@ -223,9 +239,9 @@ def adam_step(
     v: dict,
     step: int,
     lr: float,
-    beta1: float = 0.9,
-    beta2: float = 0.9,
-    eps: float = 1e-8,
+    beta1: float = ADAM_BETA1,
+    beta2: float = ADAM_BETA2,
+    eps: float = ADAM_EPS,
 ):
     """Adam optimizer step, modifies params in-place."""
     for key in params:
@@ -277,11 +293,11 @@ def sparse_scene_optimizer(
     This is an exact port of PyTorch MASt3R sparse_scene_optimizer.
     """
     if loss1_fn is None:
-        loss1_fn = gamma_loss(1.5)  # Phase 1: 3D loss (PyTorch default)
+        loss1_fn = gamma_loss(GAMMA_LOSS_3D)  # Phase 1: 3D loss
     if loss2_fn is None:
-        loss2_fn = gamma_loss(0.5)  # Phase 2: 2D loss
+        loss2_fn = gamma_loss(GAMMA_LOSS_2D)  # Phase 2: 2D loss
     if lossd_fn is None:
-        lossd_fn = gamma_loss(1.1)  # DUSt3R loss
+        lossd_fn = gamma_loss(GAMMA_LOSS_DUST3R)  # DUSt3R loss
 
     n_imgs = len(imgs)
 
@@ -296,10 +312,8 @@ def sparse_scene_optimizer(
     # Compute image diagonals for focal constraints
     diags = mx.array([np.sqrt(H**2 + W**2) for H, W in imsizes_hw])
     # Focal constraints: balance between stability and flexibility
-    # Allow focals to vary by at most 50% from base estimate
-    # This allows more freedom while still preventing extreme divergence
-    min_focals = mx.maximum(0.5 * base_focals, 0.25 * diags)
-    max_focals = mx.minimum(1.5 * base_focals, 3.0 * diags)
+    min_focals = mx.maximum(FOCAL_MIN_RATIO * base_focals, FOCAL_MIN_DIAG_RATIO * diags)
+    max_focals = mx.minimum(FOCAL_MAX_RATIO * base_focals, FOCAL_MAX_DIAG_RATIO * diags)
 
     # === Initialize parameters exactly like PyTorch ===
 
@@ -326,7 +340,7 @@ def sparse_scene_optimizer(
     # Depth parameters
     if exp_depth:
         core_depth_params = mx.concatenate(
-            [mx.log(mx.maximum(d.reshape(-1), mx.array(1e-4))) for d in core_depth]
+            [mx.log(mx.maximum(d.reshape(-1), mx.array(MIN_DEPTH))) for d in core_depth]
         )
     else:
         core_depth_params = mx.concatenate([d.reshape(-1) for d in core_depth])
@@ -362,13 +376,13 @@ def sparse_scene_optimizer(
 
         # Sizes and global scaling (like PyTorch: 1 / sizes.min())
         sizes = mx.exp(log_sizes)
-        global_scaling = 1.0 / mx.maximum(mx.min(sizes), mx.array(1e-6))  # No clipping to 1.0
+        global_scaling = 1.0 / mx.maximum(mx.min(sizes), mx.array(MIN_SIZE))
 
         # z_cameras: reparametrization like PyTorch
         z_cameras = sizes * median_depths * focals / base_focals
 
         # Build rotation matrices from quaternions
-        quats_norm = quats / mx.sqrt(mx.sum(quats**2, axis=-1, keepdims=True) + 1e-8)
+        quats_norm = quats / mx.sqrt(mx.sum(quats**2, axis=-1, keepdims=True) + EPS)
 
         def quat_to_pose(q, t):
             """Convert quaternion and translation to 4x4 pose matrix."""
@@ -546,7 +560,7 @@ def sparse_scene_optimizer(
         # Global weighted loss (PyTorch: confs @ pix_loss / confs.sum())
         dist = loss_fn(pts3d_1, pts3d_2)
         cf_sum = mx.sum(confs)
-        loss = mx.sum(confs * dist) / mx.maximum(cf_sum, mx.array(1e-8))
+        loss = mx.sum(confs * dist) / mx.maximum(cf_sum, mx.array(EPS))
 
         return loss
 
@@ -614,7 +628,7 @@ def sparse_scene_optimizer(
             total_loss = total_loss + mx.sum(w * dist1) + mx.sum(w * dist2)
             total_npix = total_npix + 2.0 * mx.sum(w)  # Count both directions
 
-        if float(total_npix) < 1e-8:
+        if float(total_npix) < EPS:
             return mx.array(0.0)
 
         return total_loss / total_npix
@@ -677,7 +691,7 @@ def sparse_scene_optimizer(
                 total_loss = total_loss + mx.sum(cf * dist)
                 total_conf = total_conf + mx.sum(cf)
 
-        return total_loss / mx.maximum(total_conf, mx.array(1e-8))
+        return total_loss / mx.maximum(total_conf, mx.array(EPS))
 
     # === Phase 1: Coarse alignment (3D loss) ===
     # IMPORTANT: PyTorch does NOT optimize focals or depths in Phase 1
@@ -738,7 +752,7 @@ def sparse_scene_optimizer(
         # Normalize quaternions after each step (like PyTorch)
         # This ensures quats remain valid rotation representations
         quats_normalized = params_p1["quats"] / mx.sqrt(
-            mx.sum(params_p1["quats"] ** 2, axis=-1, keepdims=True) + 1e-8
+            mx.sum(params_p1["quats"] ** 2, axis=-1, keepdims=True) + EPS
         )
         params_p1["quats"] = quats_normalized
 

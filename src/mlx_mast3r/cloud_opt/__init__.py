@@ -27,6 +27,12 @@ from .schedules import LRScheduler, cosine_schedule, linear_schedule
 from .sparse_ga import SparseGAResult, sparse_global_alignment
 from .tsdf import TSDFPostProcess, apply_tsdf_cleaning, clean_pointcloud
 
+# Extracted modules for sparse GA
+from .canonical import compute_canonical_view, condense_data, prepare_canonical_data
+from .correspondences import anchor_depth_offsets, extract_correspondences
+from .focal_estimation import estimate_focal_from_depth
+from .utils import hash_md5, mkdir_for
+
 __all__ = [
     # Geometry (numpy)
     "inv",
@@ -40,6 +46,7 @@ __all__ = [
     "depthmap_to_pts3d_mlx",
     # Focal estimation
     "estimate_focal",
+    "estimate_focal_from_depth",
     # Viewers
     "PairViewer",
     "Scene",
@@ -55,6 +62,14 @@ __all__ = [
     # Sparse GA
     "SparseGAResult",
     "sparse_global_alignment",
+    # Sparse GA utilities
+    "compute_canonical_view",
+    "condense_data",
+    "prepare_canonical_data",
+    "extract_correspondences",
+    "anchor_depth_offsets",
+    "hash_md5",
+    "mkdir_for",
     # TSDF Post-processing
     "TSDFPostProcess",
     "apply_tsdf_cleaning",
