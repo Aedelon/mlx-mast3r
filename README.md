@@ -5,22 +5,32 @@ Ultra-optimized MLX implementation of MASt3R and DuneMASt3R for 3D reconstructio
 ## Features
 
 - **Native Apple Silicon**: Optimized for M1/M2/M3/M4 chips using MLX
-- **Real-time Performance**: Up to 4.4x faster than PyTorch MPS
+- **Real-time Performance**: Up to 1.87× faster than PyTorch MPS (avg 1.59×)
 - **Multiple Models**: MASt3R ViT-L, DUNE Small/Base, DuneMASt3R
 - **Custom Metal Kernels**: Fused RoPE 2D, bilinear upsample, grid sample
 - **FP16/BF16 Support**: Reduced memory footprint with minimal quality loss
 
 ## Performance (M4 Max)
 
-| Model | Resolution | Latency | FPS | Speedup vs PyTorch |
-|-------|------------|---------|-----|-------------------|
-| **DUNE Small** | 336x336 | 11ms | 90 | 1.8x |
-| **DUNE Base** | 336x336 | 32ms | 31 | 1.6x |
-| **DuneMASt3R Small** | 336x336 | 184ms | 5.4 | 4.4x |
-| **DuneMASt3R Base** | 336x336 | 207ms | 4.8 | 3.9x |
-| **MASt3R Full** | 512x672 | 805ms | 1.2 | 1.5x |
+### MLX vs PyTorch MPS Benchmark
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed benchmarks.
+| Model | Resolution | PyTorch MPS | MLX FP16 | Speedup | FPS |
+|-------|------------|-------------|----------|---------|-----|
+| **DUNE Small** | 336×336 | 13.1ms | 8.6ms | **1.54×** | 117 |
+| **DUNE Small** | 448×448 | 28.9ms | 15.4ms | **1.87×** | 65 |
+| **DUNE Base** | 336×336 | 36.0ms | 24.8ms | **1.45×** | 40 |
+| **DUNE Base** | 448×448 | 75.1ms | 43.4ms | **1.73×** | 23 |
+| **MASt3R Encoder** | 512×672 | 331.7ms | 184.4ms | **1.80×** | 5.4 |
+| **MASt3R Full** | 512×672 | 1203.7ms | 767.1ms | **1.57×** | 1.3 |
+| **DuneMASt3R Small** | 336×336 | 229.7ms | 145.4ms | **1.58×** | 6.9 |
+| **DuneMASt3R Small** | 448×448 | 432.0ms | 257.1ms | **1.68×** | 3.9 |
+| **DuneMASt3R Base** | 336×336 | 283.0ms | 183.5ms | **1.54×** | 5.5 |
+| **DuneMASt3R Base** | 448×448 | 566.7ms | 504.5ms | **1.12×** | 2.0 |
+
+**Average speedup: 1.59×** faster than PyTorch MPS
+
+> Benchmarked on MacBook Pro M4 Max, 10 iterations after 10 warmup runs.
+> Run `uv run python scripts/benchmark_complete.py` to reproduce.
 
 ## Installation
 
@@ -101,12 +111,12 @@ out1, out2 = model.reconstruct(img1, img2)
 
 ### Models Overview
 
-| Class | Use Case | Speed | Quality |
-|-------|----------|-------|---------|
-| `DUNE` | Feature extraction | 11-32ms | Good |
-| `Mast3r` | Feature extraction | 183ms | Best |
-| `DuneMast3r` | 3D reconstruction | 184-207ms | Good |
-| `Mast3rFull` | 3D reconstruction | 805ms | Best |
+| Class | Use Case | Speed (MLX) | Quality |
+|-------|----------|-------------|---------|
+| `DUNE` | Feature extraction | 9-43ms | Good |
+| `Mast3r` | Feature extraction | 184ms | Best |
+| `DuneMast3r` | 3D reconstruction | 145-257ms | Good |
+| `Mast3rFull` | 3D reconstruction | 767ms | Best |
 
 ### DUNE
 

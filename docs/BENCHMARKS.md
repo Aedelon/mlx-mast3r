@@ -9,21 +9,25 @@ Detailed performance benchmarks comparing MLX implementation vs PyTorch MPS on A
 - **MLX**: 0.22.0
 - **PyTorch**: 2.5.1 (MPS backend)
 - **Precision**: FP16
-- **Warmup**: 3 iterations
+- **Warmup**: 10 iterations (MLX requires sufficient warmup for graph compilation)
 - **Benchmark**: 10 iterations (mean ± std)
 
 ## Summary Results
 
 | Model | PyTorch MPS | MLX | Speedup | Correlation |
 |-------|-------------|-----|---------|-------------|
-| DUNE Small @ 336 | 20ms | 11ms | 1.8x | 0.9999 |
-| DUNE Base @ 336 | 52ms | 32ms | 1.6x | 0.9999 |
-| DUNE Small @ 448 | 35ms | 19ms | 1.8x | 0.9999 |
-| DUNE Base @ 448 | 92ms | 56ms | 1.6x | 0.9999 |
-| MASt3R ViT-L @ 512 | 380ms | 254ms | 1.5x | 0.9998 |
-| MASt3R Full @ 512 | 1210ms | 805ms | 1.5x | 0.9997 |
-| DuneMASt3R Small @ 336 | 810ms | 184ms | 4.4x | 0.9996 |
-| DuneMASt3R Base @ 336 | 805ms | 207ms | 3.9x | 0.9996 |
+| DUNE Small @ 336 | 13.1ms | 8.6ms | 1.54x | 0.775 |
+| DUNE Small @ 448 | 28.9ms | 15.4ms | 1.87x | 0.848 |
+| DUNE Base @ 336 | 36.0ms | 24.8ms | 1.45x | 0.954 |
+| DUNE Base @ 448 | 75.1ms | 43.4ms | 1.73x | 0.934 |
+| MASt3R ViT-L @ 512 | 331.7ms | 184.4ms | 1.80x | 0.9999 |
+| MASt3R Full @ 512 | 1203.7ms | 767.1ms | 1.57x | 1.0000 |
+| DuneMASt3R Small @ 336 | 229.7ms | 145.4ms | 1.58x | 0.9994 |
+| DuneMASt3R Small @ 448 | 432.0ms | 257.1ms | 1.68x | 0.930 |
+| DuneMASt3R Base @ 336 | 283.0ms | 183.5ms | 1.54x | 0.9993 |
+| DuneMASt3R Base @ 448 | 566.7ms | 504.5ms | 1.12x | 0.9992 |
+
+**Average: 1.59x MLX faster**
 
 ## Encoder Benchmarks
 

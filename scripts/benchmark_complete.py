@@ -29,7 +29,7 @@ import mlx.core as mx  # noqa: E402
 # Configuration
 # ============================================================================
 
-WARMUP_ITERATIONS = 3
+WARMUP_ITERATIONS = 10  # MLX needs more warmup for graph compilation
 BENCHMARK_ITERATIONS = 10
 
 PTH_DIR = Path.home() / ".cache/mast3r_runtime/checkpoints"
