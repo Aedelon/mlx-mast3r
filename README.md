@@ -107,6 +107,109 @@ model = Mast3rFull.from_pretrained(resolution=512)
 out1, out2 = model.reconstruct(img1, img2)
 ```
 
+### Multi-View Reconstruction (3+ Images)
+
+For complete scene reconstruction from multiple images with camera pose optimization:
+
+```python
+from mlx_mast3r import DuneMast3r
+from mlx_mast3r.cloud_opt import sparse_global_alignment
+from mlx_mast3r.image_pairs import make_pairs
+from mlx_mast3r.utils import load_image
+import mlx.core as mx
+
+# Load model
+model = DuneMast3r.from_pretrained(encoder_variant="base", resolution=336)
+
+# Load images
+images = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+resolution = 336
+
+imgs_data = []
+for idx, path in enumerate(images):
+    img = load_image(path, resolution=resolution)
+    imgs_data.append({
+        "img": mx.array(img).transpose(2, 0, 1)[None],
+        "true_shape": img.shape[:2],
+        "idx": idx,
+        "instance": path,
+    })
+
+# Build pairs (complete graph for small sets)
+pairs = make_pairs(imgs_data, scene_graph="complete", symmetrize=True)
+
+# Run global alignment
+result = sparse_global_alignment(
+    imgs=images,
+    pairs_in=pairs,
+    cache_path="/tmp/cache",
+    model=model,
+    lr1=0.07,      # Coarse phase learning rate
+    niter1=300,    # Coarse phase iterations
+    lr2=0.01,      # Fine phase learning rate
+    niter2=300,    # Fine phase iterations
+)
+
+# Access results
+poses = result.get_im_poses()      # [N, 4, 4] camera-to-world matrices
+focals = result.get_focals()       # [N] focal lengths
+pts3d, depths, confs = result.get_dense_pts3d()  # Dense reconstruction
+```
+
+### Retrieval-Based Pair Selection
+
+For large image sets, use retrieval to automatically select the best pairs:
+
+```python
+from mlx_mast3r import Mast3rFull, make_pairs_retrieval, RetrievalModel
+
+# Load models
+model = Mast3rFull.from_pretrained(resolution=512)
+retrieval = RetrievalModel.from_pretrained()
+
+# Select pairs using visual similarity
+pairs_indices = make_pairs_retrieval(
+    retrieval=retrieval,
+    backbone=model,
+    images=images_np,  # List of numpy images
+    na=20,             # Number of adjacent candidates
+    k=10,              # Pairs per image
+)
+# Returns list of (i, j) tuples
+```
+
+## Gradio Demo
+
+Interactive web interface with stereo and multi-view reconstruction:
+
+```bash
+# Install demo dependencies
+uv sync --extra demo
+
+# Launch demo
+uv run python examples/gradio_demo.py
+```
+
+Open http://localhost:7860 in your browser. Features:
+- **DUNE Features**: Extract and visualize feature maps
+- **Stereo (2 views)**: Quick reconstruction from image pairs
+- **Multi-View (N images)**: Full scene reconstruction with optimization
+
+## Examples
+
+Command-line demos are available in `examples/`:
+
+```bash
+# DUNE feature extraction
+uv run python examples/demo_dune.py
+
+# DuneMASt3R stereo reconstruction
+uv run python examples/demo_dunemast3r.py
+
+# MASt3R full pipeline
+uv run python examples/demo_mast3r.py
+```
+
 ## API Reference
 
 ### Models Overview
@@ -213,6 +316,43 @@ Reconstruction outputs (`reconstruct()`):
 - `conf`: Per-pixel confidence (higher = more reliable)
 - `desc`: Dense descriptors for matching between views
 
+### Scene Graph Types
+
+Control which image pairs are processed in multi-view reconstruction:
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| `complete` | All pairs (N×N) | Small sets (<10 images) |
+| `swin-{k}` | Sliding window of size k | Sequential captures |
+| `logwin-{k}` | Logarithmic window | Long sequences |
+| `oneref-{id}` | One reference image | Panoramas |
+| `retrieval-{na}-{k}` | Similarity-based selection | Large unordered sets |
+
+```python
+from mlx_mast3r.image_pairs import make_pairs
+
+# Complete graph (default)
+pairs = make_pairs(imgs_data, scene_graph="complete")
+
+# Sliding window of 5
+pairs = make_pairs(imgs_data, scene_graph="swin-5")
+
+# Logarithmic window (good for video)
+pairs = make_pairs(imgs_data, scene_graph="logwin-5-noncyclic")
+```
+
+### TSDF Post-Processing
+
+Clean depth maps using Truncated Signed Distance Function:
+
+```python
+from mlx_mast3r.cloud_opt import TSDFPostProcess
+
+# After sparse_global_alignment
+processor = TSDFPostProcess(result, tsdf_thresh=0.05)
+pts3d, depths, confs = processor.get_dense_pts3d(clean_depth=True)
+```
+
 ## Architecture
 
 ```
@@ -224,14 +364,26 @@ mlx-mast3r/
 │   ├── decoders/          # 3D reconstruction decoders
 │   │   ├── mast3r.py      # MASt3R decoder + DPT head
 │   │   └── dunemast3r.py  # DUNE + MASt3R decoder
+│   ├── cloud_opt/         # Multi-view optimization
+│   │   ├── sparse_ga.py   # Sparse global alignment
+│   │   ├── optimizer.py   # Scene optimizer (MST, poses, depths)
+│   │   ├── geometry.py    # 3D geometry utilities
+│   │   ├── losses.py      # Optimization losses
+│   │   └── tsdf.py        # TSDF post-processing
 │   ├── kernels/           # Custom Metal kernels
 │   │   ├── rope2d.py      # Fused 2D RoPE
 │   │   ├── bilinear.py    # Fused bilinear upsample
 │   │   └── grid_sample.py # Grid sampling
-│   └── models.py          # High-level API
+│   ├── models.py          # High-level API
+│   ├── retrieval.py       # Image pair retrieval
+│   └── image_pairs.py     # Scene graph construction
+├── examples/
+│   ├── gradio_demo.py     # Interactive web demo
+│   ├── demo_dune.py       # DUNE feature extraction
+│   ├── demo_dunemast3r.py # DuneMASt3R stereo
+│   └── demo_mast3r.py     # MASt3R full pipeline
 ├── scripts/
-│   ├── benchmark_complete.py  # MLX vs PyTorch benchmarks
-│   └── profile_gpu.py         # Component profiling
+│   └── benchmark_complete.py  # MLX vs PyTorch benchmarks
 └── docs/
     └── BENCHMARKS.md      # Detailed benchmarks
 ```
@@ -318,17 +470,13 @@ All weights are cached in `~/.cache/mlx-mast3r/`.
 
 ## Benchmarking
 
-### Run Complete Benchmark
+Run the complete MLX vs PyTorch MPS benchmark:
 
 ```bash
 uv run python scripts/benchmark_complete.py
 ```
 
-### Profile GPU Components
-
-```bash
-uv run python scripts/profile_gpu.py
-```
+This will test all models (DUNE, MASt3R, DuneMASt3R) with warmup and correlation validation.
 
 ## Requirements
 
@@ -351,6 +499,58 @@ uv run ruff check src/
 
 # Format
 uv run ruff format src/
+```
+
+## Troubleshooting
+
+### MLX requires warmup
+
+MLX compiles computation graphs on first execution. Always warm up models before benchmarking:
+
+```python
+# Warmup (10 iterations recommended)
+for _ in range(10):
+    _ = model.reconstruct(img1, img2)
+
+# Now benchmark
+```
+
+### Memory issues on large images
+
+Reduce resolution or use FP16 precision:
+
+```python
+model = DuneMast3r.from_pretrained(
+    resolution=336,    # Lower resolution
+    precision="fp16",  # Half precision
+)
+```
+
+### Multi-view reconstruction fails
+
+1. Ensure at least 2 images with overlap
+2. Check `matching_conf_thr` (lower = more matches)
+3. Use `complete` scene graph for small sets
+4. Enable `verbose=True` to debug
+
+### Weights not downloading
+
+Manually download from HuggingFace:
+
+```bash
+# MASt3R
+huggingface-cli download Aedelon/mast3r-vit-large-fp16 --local-dir ~/.cache/mlx-mast3r/mast3r
+
+# DuneMASt3R
+huggingface-cli download Aedelon/dunemast3r-models-fp16 --local-dir ~/.cache/mlx-mast3r/dunemast3r
+```
+
+### PyTorch benchmarks not running
+
+Install benchmark dependencies:
+
+```bash
+uv sync --extra benchmark
 ```
 
 ## Citation
