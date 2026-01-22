@@ -991,3 +991,153 @@ class Mast3rDecoderEngine:
         for _ in range(iterations):
             out1, out2 = self(dummy, dummy)
             mx.eval(out1["pts3d"], out2["pts3d"])
+
+    # =========================================================================
+    # Feature caching API for SLAM (encode once, decode many)
+    # =========================================================================
+
+    def encode_image(self, img: np.ndarray) -> mx.array:
+        """Encode a single image to features.
+
+        This is useful for caching features in SLAM - encode once per frame,
+        then reuse for multiple decode operations.
+
+        Args:
+            img: [H, W, 3] uint8 image
+
+        Returns:
+            [1, N, D] encoder features (ready for decoder)
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+
+        # MASt3R preprocessing: normalize to [-1, 1]
+        x = img.astype(np.float32) / 255.0
+        x = (x - 0.5) / 0.5
+        x = mx.array(x[None, :, :, :])
+
+        # Encode - use non-compiled encoder for cache compatibility
+        feat = self.encoder(x)
+
+        # Cast to model dtype
+        feat = feat.astype(self.decoder_config.dtype)
+
+        mx.eval(feat)
+        return feat
+
+    def decode_pair(
+        self,
+        feat1: mx.array,
+        feat2: mx.array,
+        shape1: tuple[int, int] | None = None,
+        shape2: tuple[int, int] | None = None,
+    ) -> tuple[dict, dict]:
+        """Decode a pair of pre-encoded features.
+
+        Use this with encode_image() for efficient SLAM:
+        - Encode keyframe once, cache features
+        - For each new frame: encode new frame, decode with cached keyframe features
+
+        Args:
+            feat1: [1, N, D] features for view 1
+            feat2: [1, N, D] features for view 2
+            shape1: (H, W) patch grid shape for view 1 (optional, inferred from feat1)
+            shape2: (H, W) patch grid shape for view 2 (optional, inferred from feat2)
+
+        Returns:
+            (output1, output2) dicts with pts3d, conf, desc
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+
+        # Infer patch dimensions from features if not provided
+        # feat shape is [1, N, D] where N = H * W
+        if shape1 is None:
+            N1 = feat1.shape[1]
+            # Assume square or near-square grid, try common aspect ratios
+            # For 512x384 -> 32x24 = 768 patches
+            # For 512x672 -> 32x42 = 1344 patches
+            # Try 4:3 aspect first (32x24), then square
+            if N1 == 768:  # 32x24
+                shape1 = (32, 24)
+            elif N1 == 1024:  # 32x32
+                shape1 = (32, 32)
+            elif N1 == 1344:  # 32x42
+                shape1 = (32, 42)
+            else:
+                # Try to find factors close to square
+                import math
+                sqrt_n = int(math.sqrt(N1))
+                for h in range(sqrt_n, 0, -1):
+                    if N1 % h == 0:
+                        shape1 = (h, N1 // h)
+                        break
+        if shape2 is None:
+            N2 = feat2.shape[1]
+            if N2 == 768:
+                shape2 = (32, 24)
+            elif N2 == 1024:
+                shape2 = (32, 32)
+            elif N2 == 1344:
+                shape2 = (32, 42)
+            else:
+                import math
+                sqrt_n = int(math.sqrt(N2))
+                for h in range(sqrt_n, 0, -1):
+                    if N2 % h == 0:
+                        shape2 = (h, N2 // h)
+                        break
+
+        # Don't use compiled decoder - mx.compile has issues with cached features
+        out1, out2 = self.decoder(feat1, feat2, shape1, shape2)
+
+        return out1, out2
+
+    def infer_with_cached_features(
+        self,
+        img1: np.ndarray | None,
+        img2: np.ndarray | None,
+        feat1: mx.array | None = None,
+        feat2: mx.array | None = None,
+    ) -> tuple[dict, dict, mx.array, mx.array, float]:
+        """Inference with optional cached features.
+
+        Allows mixing new images and cached features for efficient SLAM.
+
+        Args:
+            img1: [H, W, 3] image for view 1 (or None if feat1 provided)
+            img2: [H, W, 3] image for view 2 (or None if feat2 provided)
+            feat1: [1, N, D] cached features for view 1 (or None to encode img1)
+            feat2: [1, N, D] cached features for view 2 (or None to encode img2)
+
+        Returns:
+            (output1, output2, feat1, feat2, time_ms)
+            - output1/output2: decoded outputs
+            - feat1/feat2: encoded features (for caching)
+            - time_ms: total time
+        """
+        import time
+
+        t0 = time.perf_counter()
+
+        # Encode or use cached features
+        if feat1 is None:
+            if img1 is None:
+                raise ValueError("Either img1 or feat1 must be provided")
+            feat1 = self.encode_image(img1)
+        if feat2 is None:
+            if img2 is None:
+                raise ValueError("Either img2 or feat2 must be provided")
+            feat2 = self.encode_image(img2)
+
+        # Decode
+        out1, out2 = self.decode_pair(feat1, feat2)
+        mx.eval(out1["pts3d"], out2["pts3d"])
+
+        ms = (time.perf_counter() - t0) * 1000
+
+        # Convert outputs to numpy
+        out1_np = {k: np.array(v[0]) for k, v in out1.items()}
+        out2_np = {k: np.array(v[0]) for k, v in out2.items()}
+
+        return out1_np, out2_np, feat1, feat2, ms

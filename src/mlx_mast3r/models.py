@@ -235,6 +235,62 @@ class DuneMast3r:
         mx.eval(feat)
         return np.array(feat[0])
 
+    # =========================================================================
+    # Feature caching API for SLAM
+    # =========================================================================
+
+    def encode_to_features(self, image: np.ndarray) -> mx.array:
+        """Encode image to normalized features for caching.
+
+        Args:
+            image: [H, W, 3] uint8 image
+
+        Returns:
+            [1, N, D] normalized features ready for decoder
+        """
+        return self.engine.encode_image(image)
+
+    def decode_with_features(
+        self,
+        feat1: mx.array,
+        feat2: mx.array,
+    ) -> tuple[dict, dict]:
+        """Decode pair using pre-encoded features.
+
+        Args:
+            feat1: [1, N, D] features for view 1
+            feat2: [1, N, D] features for view 2
+
+        Returns:
+            (output1, output2) dicts with pts3d, conf, desc
+        """
+        return self.engine.decode_pair(feat1, feat2)
+
+    def reconstruct_with_cache(
+        self,
+        img1: np.ndarray | None,
+        img2: np.ndarray | None,
+        feat1: mx.array | None = None,
+        feat2: mx.array | None = None,
+    ) -> tuple[dict, dict, mx.array, mx.array]:
+        """Reconstruct with optional cached features.
+
+        Efficient for SLAM: encode keyframe once, reuse for many frames.
+
+        Args:
+            img1: Image for view 1 (or None if feat1 provided)
+            img2: Image for view 2 (or None if feat2 provided)
+            feat1: Cached features for view 1
+            feat2: Cached features for view 2
+
+        Returns:
+            (out1, out2, feat1, feat2) - outputs and features for caching
+        """
+        out1, out2, feat1, feat2, _ = self.engine.infer_with_cached_features(
+            img1, img2, feat1, feat2
+        )
+        return out1, out2, feat1, feat2
+
 
 class Mast3rFull:
     """Full MASt3R pipeline: encoder + decoder for highest quality 3D.
@@ -310,6 +366,62 @@ class Mast3rFull:
         feat = self.engine.encoder(x)
         mx.eval(feat)
         return np.array(feat[0])
+
+    # =========================================================================
+    # Feature caching API for SLAM
+    # =========================================================================
+
+    def encode_to_features(self, image: np.ndarray) -> mx.array:
+        """Encode image to features for caching.
+
+        Args:
+            image: [H, W, 3] uint8 image
+
+        Returns:
+            [1, N, D] features ready for decoder
+        """
+        return self.engine.encode_image(image)
+
+    def decode_with_features(
+        self,
+        feat1: mx.array,
+        feat2: mx.array,
+    ) -> tuple[dict, dict]:
+        """Decode pair using pre-encoded features.
+
+        Args:
+            feat1: [1, N, D] features for view 1
+            feat2: [1, N, D] features for view 2
+
+        Returns:
+            (output1, output2) dicts with pts3d, conf, desc
+        """
+        return self.engine.decode_pair(feat1, feat2)
+
+    def reconstruct_with_cache(
+        self,
+        img1: np.ndarray | None,
+        img2: np.ndarray | None,
+        feat1: mx.array | None = None,
+        feat2: mx.array | None = None,
+    ) -> tuple[dict, dict, mx.array, mx.array]:
+        """Reconstruct with optional cached features.
+
+        Efficient for SLAM: encode keyframe once, reuse for many frames.
+
+        Args:
+            img1: Image for view 1 (or None if feat1 provided)
+            img2: Image for view 2 (or None if feat2 provided)
+            feat1: Cached features for view 1
+            feat2: Cached features for view 2
+
+        Returns:
+            (out1, out2, feat1, feat2) - outputs and features for caching
+        """
+        out1, out2, feat1, feat2, _ = self.engine.infer_with_cached_features(
+            img1, img2, feat1, feat2
+        )
+        return out1, out2, feat1, feat2
 
     @property
     def embed_dim(self) -> int:
